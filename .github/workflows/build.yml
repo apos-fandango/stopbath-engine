@@ -8,6 +8,13 @@ on:
 
 env:
   ART_VERSION: "1.26.10"   # the ART release the helper is built from (StopBath's ART)
+  LIBRAW_COMMIT: "2caab57e269cc7fce17c3189e4d4d7e3e5861875"   # LibRaw and CTL as of 2026-10-22 (kept the same)
+  CTL_COMMIT: "e280b6c4cf49726914260f1cf0cb2949d8db1027"
+
+# A newer upload stops the build of an older one (only the newest matters).
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -64,7 +71,16 @@ jobs:
               pacman --noconfirm -S custom-${ART_MSYS2_REPO}/${ART_PKG_PREFIX}-${p}
           done
 
+      # exiv2, LibRaw and CTL are built once and kept between builds (they don't change), saving several minutes.
+      - name: Libraries kept from an earlier build
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: C:\msys2\msys64\usr\local
+          key: deps-windows-ucrt64-1.0.2-exiv2-0.27.7-libraw-${{ env.LIBRAW_COMMIT }}-ctl-${{ env.CTL_COMMIT }}-v1
+
       - name: Install exiv2
+        if: steps.deps.outputs.cache-hit != 'true'
         run: |
           wget https://github.com/Exiv2/exiv2/releases/download/v0.27.7/exiv2-0.27.7-Source.tar.gz
           tar xzf exiv2-0.27.7-Source.tar.gz
@@ -75,9 +91,13 @@ jobs:
           ninja install
 
       - name: Install LibRaw
+        if: steps.deps.outputs.cache-hit != 'true'
         run: |
-          git clone --depth 1 https://github.com/LibRaw/LibRaw.git
+          mkdir LibRaw
           cd LibRaw
+          git init -q
+          git fetch -q --depth 1 https://github.com/LibRaw/LibRaw.git ${LIBRAW_COMMIT}
+          git checkout -q FETCH_HEAD
           autoreconf -i
           export CC=gcc
           export CXX=g++
@@ -86,13 +106,22 @@ jobs:
           make install
 
       - name: Install CTL
+        if: steps.deps.outputs.cache-hit != 'true'
         run: |
-          git clone --depth 1 https://github.com/ampas/CTL.git
+          mkdir CTL
+          (cd CTL && git init -q && git fetch -q --depth 1 https://github.com/ampas/CTL.git ${CTL_COMMIT} && git checkout -q FETCH_HEAD)
           mkdir build-CTL
           cd build-CTL
           cmake -GNinja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=c:/msys2/msys64/usr/local \
             -DCMAKE_CXX_FLAGS="-fpermissive -fms-extensions" -DCTL_BUILD_TESTS=0 -DCTL_BUILD_TOOLS=0 ../CTL
           ninja install
+
+      - name: Check the libraries are there
+        run: |
+          test -f /usr/local/lib/pkgconfig/exiv2.pc
+          ls /usr/local/lib/pkgconfig/libraw*.pc
+          test -f /usr/local/include/CTL/CtlInterpreter.h
+          echo "exiv2, LibRaw and CTL ready"
 
       - name: Add the helper to ART's build
         run: |
@@ -126,6 +155,7 @@ jobs:
           test -f bundle/stopbath-engine.exe || cp build/Release/stopbath-engine.exe bundle/
           cp repo/LICENSE bundle/STOPBATH-ENGINE-LICENSE.txt
           cp repo/README.md bundle/STOPBATH-ENGINE-README.md
+          echo "${ART_VERSION}" > bundle/ART-VERSION.txt   # (StopBath reads which ART the folder holds)
 
       - name: Try it
         run: |
@@ -133,6 +163,12 @@ jobs:
           ./stopbath-engine.exe --version
           ./stopbath-engine.exe --render ../art/data/images/png/ART-logo-256.png ../test.jpg --repeat 3
           test -f ../test.jpg && echo "test picture made"
+          # as StopBath talks to it: two requests to one helper, the second with the photo kept
+          printf 'run 1 7\n-o\n../serve1.tif\n-t\n-b8\n-Y\n-c\n../test.jpg\nrun 2 7\n-o\n../serve2.tif\n-t\n-b8\n-Y\n-c\n../test.jpg\nquit\n' \
+            | ./stopbath-engine.exe --serve | tee ../serve.txt
+          grep -q "@@SB ready" ../serve.txt
+          grep -q "@@SB done 2 0 .*photo:kept" ../serve.txt
+          test -f ../serve2.tif && echo "served"
 
       - name: Keep the result (download it from this run's page)
         uses: actions/upload-artifact@v4
