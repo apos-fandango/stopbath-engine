@@ -156,8 +156,16 @@ int main(int argc, char **argv)
     } else {
         options.ART_base_dir = Glib::build_filename(exePath, DATA_SEARCH_PATH);
     }
-    creditsPath = Glib::path_is_absolute(CREDITS_SEARCH_PATH) ? Glib::ustring(CREDITS_SEARCH_PATH) : Glib::build_filename(exePath, CREDITS_SEARCH_PATH);
-    licensePath = Glib::path_is_absolute(LICENCE_SEARCH_PATH) ? Glib::ustring(LICENCE_SEARCH_PATH) : Glib::build_filename(exePath, LICENCE_SEARCH_PATH);
+    if (Glib::path_is_absolute(CREDITS_SEARCH_PATH)) {
+        creditsPath = CREDITS_SEARCH_PATH;
+    } else {
+        creditsPath = Glib::build_filename(exePath, CREDITS_SEARCH_PATH);
+    }
+    if (Glib::path_is_absolute(LICENCE_SEARCH_PATH)) {
+        licensePath = LICENCE_SEARCH_PATH;
+    } else {
+        licensePath = Glib::build_filename(exePath, LICENCE_SEARCH_PATH);
+    }
     options.rtSettings.lensfunDbDirectory = LENSFUN_DB_PATH;
 #else
     options.ART_base_dir = DATA_SEARCH_PATH;
