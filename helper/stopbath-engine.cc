@@ -1,38 +1,75 @@
 /*
- *  StopBath engine helper - step 1.
+ *  StopBath engine helper - step 2.
  *
  *  A small program built from ART's own processing engine (ART by Alberto Griggio, a fork of RawTherapee), for
- *  StopBath. This first step only proves that ART's engine builds and starts here, and times one photo:
+ *  StopBath. StopBath starts it once and sends it the same requests it would give ART-cli; it answers them without
+ *  starting again, keeps the last photos loaded and reuses ART's raw steps (preprocessing, demosaicing) when only
+ *  later settings changed:
  *
  *    stopbath-engine --version
+ *    stopbath-engine --serve [--keep <n>]
+ *        requests on standard input, one at a time:
+ *          run <id> <count>        then <count> lines: ART-cli's arguments (-o/-O, -p, -d, -Y, -f, -j, -js, -t, -b,
+ *                                  -n, -c <one photo>), one per line
+ *          cancel <id>             stop that request at the next step
+ *          quit
+ *        answers on standard output (other lines there are ART's own and can be ignored):
+ *          @@SB ready <helper version> <ART version>
+ *          @@SB done <id> <exit code> <ms> <what was reused> <message>
+ *        exit code 0: done as ART-cli would; 99: not something the helper does (use ART-cli); 98: stopped
  *    stopbath-engine --render <photo> <out.jpg> [--profile <file.arp>]... [--fast] [--repeat <n>]
+ *        times one photo, developed n times in one go (step 1's test)
  *
- *  --repeat develops the same photo n times from one loading (how much a helper that stays open saves on loading).
- *  Later steps keep the photo and the unchanged steps in memory and take changes from StopBath through a pipe.
- *
- *  Copyright (c) 2026 the StopBath engine helper's authors. Based on ART's main-cli.cc.
+ *  Copyright (c) 2026 the StopBath engine helper's authors. Based on ART's main-cli.cc and simpleprocess.cc
+ *  (Copyright (c) 2004-2010 Gabor Horvath, Alberto Griggio and the RawTherapee and ART authors).
  *  This program is free software: you can redistribute it and/or modify it under the terms of the GNU General
  *  Public License as published by the Free Software Foundation, either version 3 of the License, or (at your
  *  option) any later version (see LICENSE).
  */
 
+#include "../engine/colortemp.h"
+#include "../engine/curves.h"
+#include "../engine/dcp.h"
+#include "../engine/iccstore.h"
+#include "../engine/imagesource.h"
 #include "../engine/imgiomanager.h"
-#include "../engine/profilestore.h"
-#include "../engine/settings.h"
+#include "../engine/improcfun.h"
+#include "../engine/metadata.h"
+#include "../engine/processingjob.h"
 #include "../engine/procparams.h"
+#include "../engine/profilestore.h"
+#include "../engine/rawimagesource.h"
 #include "../engine/rtengine.h"
+#include "../engine/settings.h"
 #include "../utils/config.h"
 #include "../utils/pathutils.h"
 #include "../utils/version.h"
 #include "fastexport.h"
 #include "options.h"
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <giomm.h>
 #include <iostream>
 #include <locale.h>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
 #include <tiffio.h>
+#include <unordered_map>
 #include <vector>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
+
+#undef THREAD_PRIORITY_NORMAL
 
 namespace art { namespace gui {
 using namespace utils;
@@ -44,95 +81,1253 @@ Glib::ustring argv1;
 bool progress = false;
 } } // namespace art::gui
 
-using namespace art::gui;
 using Clock = std::chrono::steady_clock;
 
 namespace {
 
-const char *HelperVersion = "0.1";
+const char *HelperVersion = "0.2";
 
 double ms(Clock::time_point a, Clock::time_point b)
 {
     return std::chrono::duration<double, std::milli>(b - a).count();
 }
 
-Glib::ustring extensionOf(const Glib::ustring &f)
+} // namespace
+
+// ---- ART's export pipeline (simpleprocess.cc), with the raw steps reused and stopping between steps ----
+
+namespace art { namespace engine {
+extern const Settings *settings;
+
+namespace sb {
+
+/** What ART's raw steps (preprocessing, demosaicing, the highlight reconstruction done on their result) depend on:
+ *  the same again, their result in the image source is reused (as ART's editor does). */
+struct RawKey {
+    bool valid = false;
+    procparams::RAWParams raw;
+    procparams::LensProfParams lens;
+    procparams::CoarseTransformParams coarse;
+    bool denoise = false;
+    double wbTemp = 0, wbGreen = 0, wbEqual = 0, mul[3] = {0, 0, 0};
+    bool hrOn = false;
+    int hrMode = 0, hrBlur = 0;
+    int frame = 0, border = 0;
+    bool wbOn = false;
+    int wbMethod = 0;
+    double wbEqualSet = 1;
+
+    bool same(const RawKey &o) const
+    {
+        return valid && o.valid && raw == o.raw && lens == o.lens && coarse == o.coarse && denoise == o.denoise &&
+               wbTemp == o.wbTemp && wbGreen == o.wbGreen && wbEqual == o.wbEqual && mul[0] == o.mul[0] &&
+               mul[1] == o.mul[1] && mul[2] == o.mul[2] && hrOn == o.hrOn && hrMode == o.hrMode &&
+               hrBlur == o.hrBlur && frame == o.frame && border == o.border && wbOn == o.wbOn &&
+               wbMethod == o.wbMethod && wbEqualSet == o.wbEqualSet;
+    }
+};
+
+/** What the noise measured for automatic chroma noise reduction depends on (ART-cli measures it every time): the
+ *  raw steps' result, the white balance, the turn, the colour settings, highlight reconstruction, the noise settings. */
+struct DnKey {
+    bool valid = false;
+    RawKey raw;
+    double wb[6] = {0, 0, 0, 0, 0, 0};
+    procparams::CoarseTransformParams coarse;
+    procparams::ColorManagementParams icm;
+    bool hrOn = false;
+    int hrMode = 0, hrBlur = 0;
+    procparams::DenoiseParams denoise;
+
+    bool same(const DnKey &o) const
+    {
+        return valid && o.valid && raw.same(o.raw) && std::equal(wb, wb + 6, o.wb) && coarse == o.coarse &&
+               icm == o.icm && hrOn == o.hrOn && hrMode == o.hrMode && hrBlur == o.hrBlur && denoise == o.denoise;
+    }
+};
+
+/** ART keeps the automatic white balance it worked out in the image source: worked out again after the raw steps
+ *  are done again (as ART-cli, which starts afresh each time). */
+struct AwbReset: ImageSource {
+    static void reset(ImageSource *src)
+    {
+        src->*(&AwbReset::redAWBMul) = -1.;
+        src->*(&AwbReset::greenAWBMul) = -1.;
+        src->*(&AwbReset::blueAWBMul) = -1.;
+    }
+};
+
+/** What the screen-size picture ART starts from (the raw steps' result read out, its spots removed, made small on
+ *  the quick route) depends on: the same again, a copy of it is reused. */
+struct EarlyKey {
+    bool valid = false;
+    RawKey raw;
+    double wb[6] = {0, 0, 0, 0, 0, 0};
+    int tr = 0, fw = 0, fh = 0, imw = 0, imh = 0;
+    double scale = 1;
+    bool allow = false;
+    procparams::SpotParams spot;
+    int outW = 0, outH = 0;
+
+    bool same(const EarlyKey &o) const
+    {
+        return valid && o.valid && raw.same(o.raw) && std::equal(wb, wb + 6, o.wb) && tr == o.tr && fw == o.fw &&
+               fh == o.fh && imw == o.imw && imh == o.imh && scale == o.scale && allow == o.allow && spot == o.spot;
+    }
+};
+
+/** What one photo keeps between requests. */
+struct Kept {
+    RawKey raw;
+    EarlyKey early;
+    std::unique_ptr<Imagefloat> earlyImg;
+    ImProcFunctions::DenoiseInfoStore dn;   // (the noise measured for automatic chroma noise reduction)
+    DnKey dnKey;
+};
+
+struct Times {
+    double raw = 0, develop = 0;
+    bool rawReused = false, earlyReused = false;
+};
+
+enum { STOPPED = -100 };
+
+class Processor {
+public:
+    Processor(ProcessingJobImpl &job, Kept &kept, const std::atomic<bool> &cancel, Times &times, int &errorCode)
+        : job(job), kept(kept), cancel(cancel), times(times), errorCode(errorCode)
+    {
+    }
+
+    Imagefloat *operator()()
+    {
+        auto t0 = Clock::now();
+        Imagefloat *res = nullptr;
+        bool fast = job.fast && job.pparams.resize.enabled;
+        try {
+            res = run(fast);
+        } catch (...) {
+            delete img;
+            img = nullptr;
+            throw;
+        }
+        if (!res) {
+            delete img;
+            img = nullptr;
+        }
+        times.develop = ms(t0, Clock::now()) - times.raw;
+        return res;
+    }
+
+private:
+    Imagefloat *run(bool fast)
+    {
+        Imagefloat *res = nullptr;
+        if (stage_init(fast) && !stopped()) {
+            if (!stopped()) {
+                stage_denoise();
+            }
+            if (!stopped()) {
+                stage_transform();
+            }
+            if (!stopped()) {
+                res = stage_finish(fast);
+            }
+        }
+        return res;
+    }
+
+    bool stopped()
+    {
+        if (cancel.load()) {
+            errorCode = STOPPED;
+            return true;
+        }
+        return false;
+    }
+
+    bool stage_init(bool is_fast)
+    {
+        errorCode = 0;
+        ii = job.initialImage;
+        procparams::ProcParams &params = job.pparams;
+
+        imgsrc = ii->getImageSource();
+
+        tr = getCoarseBitMask(params.coarse);
+        int border = 0;
+        if (imgsrc->getSensorType() == ST_BAYER) {
+            border = params.raw.bayersensor.method != RAWParams::BayerSensor::Method::PIXELSHIFT
+                         ? params.raw.bayersensor.border
+                         : std::max(params.raw.bayersensor.border, 2);
+            imgsrc->setBorder(border);
+        } else if (imgsrc->getSensorType() == ST_FUJI_XTRANS) {
+            border = params.raw.xtranssensor.border;
+            imgsrc->setBorder(border);
+        }
+        imgsrc->getFullSize(fw, fh, tr);
+
+        if (!params.crop.hasGeometry()) {
+            params.crop.setDefaultGeometry(fw, fh);
+        }
+
+        if (params.crop.x > fw || params.crop.y > fh) {
+            params.crop.enabled = false;
+            params.crop.x = 0;
+            params.crop.y = 0;
+            params.crop.w = fw;
+            params.crop.h = fh;
+        } else {
+            if (params.crop.x < 0) {
+                params.crop.x = 0;
+            }
+            if (params.crop.y < 0) {
+                params.crop.y = 0;
+            }
+            if (params.crop.w <= 0 || (params.crop.x + params.crop.w) > fw) {
+                params.crop.w = fw - params.crop.x;
+            }
+            if (params.crop.h <= 0 || (params.crop.y + params.crop.h) > fh) {
+                params.crop.h = fh - params.crop.y;
+            }
+        }
+
+        ipf_p.reset(new ImProcFunctions(&params, true));
+        ImProcFunctions &ipf = *(ipf_p.get());
+        ipf.setPipeline(ImProcFunctions::Pipeline::OUTPUT);
+        scale_factor = 1.0;
+        if (is_fast) {
+            int imw, imh;
+            scale_factor = ipf.resizeScale(&params, fw, fh, imw, imh);
+            adjust_procparams(scale_factor);
+        }
+
+        imgsrc->setCurrentFrame(params.raw.bayersensor.imageNum);
+
+        currWB = ColorTemp();
+        if (params.wb.enabled) {
+            switch (params.wb.method) {
+            case WBParams::CAMERA:
+                currWB = imgsrc->getWB();
+                break;
+            case WBParams::CUSTOM_TEMP:
+                currWB = ColorTemp(params.wb.temperature, params.wb.green, params.wb.equal, "Custom");
+                break;
+            case WBParams::CUSTOM_MULT_LEGACY:
+                currWB = ColorTemp(params.wb.mult[0], params.wb.mult[1], params.wb.mult[2], 1.0);
+                break;
+            case WBParams::CUSTOM_MULT: {
+                double rm = params.wb.mult[0];
+                double gm = params.wb.mult[1];
+                double bm = params.wb.mult[2];
+                imgsrc->wbCamera2Mul(rm, gm, bm);
+                currWB = ColorTemp(rm, gm, bm);
+            } break;
+            case WBParams::AUTO:
+            default:
+                currWB = ColorTemp();
+            }
+        }
+
+        // the raw steps: reused when what they depend on is the same as last time on this photo
+        RawKey key;
+        key.valid = true;
+        key.raw = params.raw;
+        // (the other kind of sensor's settings don't matter - the quick route changes X-Trans ones on any photo)
+        if (imgsrc->getSensorType() != ST_FUJI_XTRANS) {
+            key.raw.xtranssensor = procparams::RAWParams::XTransSensor();
+        }
+        if (imgsrc->getSensorType() != ST_BAYER) {
+            key.raw.bayersensor = procparams::RAWParams::BayerSensor();
+        }
+        key.lens = params.lensProf;
+        key.coarse = params.coarse;
+        key.denoise = params.denoise.enabled;
+        key.wbTemp = currWB.getTemp();
+        key.wbGreen = currWB.getGreen();
+        key.wbEqual = currWB.getEqual();
+        if (currWB.getTemp() > 0) {
+            currWB.getMultipliers(key.mul[0], key.mul[1], key.mul[2]);
+        }
+        key.hrOn = params.exposure.enabled;
+        key.hrMode = int(params.exposure.hrmode);
+        key.hrBlur = params.exposure.hrblur;
+        key.frame = params.raw.bayersensor.imageNum;
+        key.border = border;
+        key.wbOn = params.wb.enabled;
+        key.wbMethod = int(params.wb.method);
+        key.wbEqualSet = params.wb.equal;
+
+        auto r0 = Clock::now();
+        if (key.same(kept.raw)) {
+            times.rawReused = true;
+        } else {
+            kept.raw.valid = false;
+            kept.early.valid = false;
+            kept.earlyImg.reset();
+            kept.dnKey.valid = false;
+            kept.dn.reset();
+            AwbReset::reset(imgsrc);
+            imgsrc->preprocess(params.raw, params.lensProf, params.coarse, params.denoise.enabled, currWB);
+            if (stopped()) {
+                return false;
+            }
+            bool autoContrast = imgsrc->getSensorType() == ST_BAYER
+                                    ? params.raw.bayersensor.dualDemosaicAutoContrast
+                                    : params.raw.xtranssensor.dualDemosaicAutoContrast;
+            double contrastThreshold = imgsrc->getSensorType() == ST_BAYER
+                                           ? params.raw.bayersensor.dualDemosaicContrast
+                                           : params.raw.xtranssensor.dualDemosaicContrast;
+            imgsrc->demosaic(params.raw, autoContrast, contrastThreshold);
+            kept.raw = key;
+        }
+        times.raw = ms(r0, Clock::now());
+        if (stopped()) {
+            return false;
+        }
+
+        if (params.wb.method == WBParams::AUTO) {
+            double rm, gm, bm;
+            imgsrc->getAutoWBMultipliers(rm, gm, bm);
+            if (rm != -1.) {
+                if (params.wb.equal == 1) {
+                    currWB = ColorTemp(rm, gm, bm);
+                } else {
+                    currWB = ColorTemp(rm, gm, bm, params.wb.equal);
+                }
+            } else {
+                currWB.useDefaults(params.wb.equal);
+            }
+        }
+
+        pp = PreviewProps(0, 0, fw, fh, 1);
+
+        // the noise measured for automatic chroma noise reduction: kept while what it depends on is the same
+        if (params.denoise.enabled) {
+            DnKey dkey;
+            dkey.valid = true;
+            dkey.raw = kept.raw;
+            dkey.wb[0] = currWB.getTemp();
+            dkey.wb[1] = currWB.getGreen();
+            dkey.wb[2] = currWB.getEqual();
+            if (currWB.getTemp() > 0) {
+                currWB.getMultipliers(dkey.wb[3], dkey.wb[4], dkey.wb[5]);
+            }
+            dkey.coarse = params.coarse;
+            dkey.icm = params.icm;
+            dkey.hrOn = params.exposure.enabled;
+            dkey.hrMode = int(params.exposure.hrmode);
+            dkey.hrBlur = params.exposure.hrblur;
+            dkey.denoise = params.denoise;
+            if (!dkey.same(kept.dnKey)) {
+                kept.dn.reset();
+            }
+            kept.dnKey = dkey;
+            kept.dnKey.valid = false;   // (until it has been measured)
+            ipf.denoiseComputeParams(imgsrc, currWB, kept.dn, params.denoise);
+            kept.dnKey.valid = kept.dn.valid;
+        }
+
+        // the small picture ART starts from on the quick route: reused while what it depends on is the same
+        EarlyKey ekey;
+        if (is_fast) {
+            ekey.valid = true;
+            ekey.raw = kept.raw;
+            ekey.wb[0] = currWB.getTemp();
+            ekey.wb[1] = currWB.getGreen();
+            ekey.wb[2] = currWB.getEqual();
+            if (currWB.getTemp() > 0) {
+                currWB.getMultipliers(ekey.wb[3], ekey.wb[4], ekey.wb[5]);
+            }
+            ekey.tr = tr;
+            ekey.fw = fw;
+            ekey.fh = fh;
+            ekey.scale = scale_factor;
+            ekey.imw = fw * scale_factor + 0.5;
+            ekey.imh = fh * scale_factor + 0.5;
+            ekey.allow = params.resize.allowUpscaling || params.resize.dataspec == 0;
+            ekey.spot = params.spot;
+            if (!(params.spot.enabled && !params.spot.entries.empty())) {
+                ekey.spot = procparams::SpotParams();   // (spots off: their list doesn't matter)
+            }
+        }
+        // (reused: the request that made it read the picture out already, so ART's in-place highlight reconstruction
+        // is done, as below for the steps that follow)
+        bool reuse = is_fast && kept.earlyImg && ekey.same(kept.early);
+        if (reuse) {
+            img = kept.earlyImg->copy();
+        } else {
+            img = new Imagefloat(fw, fh);
+            imgsrc->getImage(currWB, tr, img, pp, params.exposure, params.raw);
+        }
+        img->assignColorSpace(params.icm.workingProfile);
+
+        if (params.toneCurve.histmatching) {
+            if (!params.toneCurve.fromHistMatching) {
+                imgsrc->getAutoMatchedToneCurve(params.icm, params.toneCurve.curve, params.toneCurve.curve2);
+            }
+        }
+        if (params.logenc.enabled && params.logenc.autocompute) {
+            ipf.getAutoLog(imgsrc, params.logenc);
+        }
+        if (params.sharpening.enabled && params.sharpening.deconvAutoRadius) {
+            float r = 0.f;
+            if (imgsrc->getDeconvAutoRadius(&r)) {
+                params.sharpening.deconvradius = r;
+            }
+        }
+
+        if (reuse) {
+            fw = kept.early.outW;
+            fh = kept.early.outH;
+            times.earlyReused = true;
+            return true;
+        }
+
+        if (params.spot.enabled && !params.spot.entries.empty()) {
+            ipf.removeSpots(img, imgsrc, params.spot.entries, pp, currWB, nullptr, tr, nullptr);
+        }
+        if (is_fast) {
+            if (stopped()) {
+                return false;
+            }
+            kept.early.valid = false;
+            stage_early_resize();
+            kept.early = ekey;
+            kept.early.outW = fw;
+            kept.early.outH = fh;
+            kept.earlyImg.reset(img->copy());
+        }
+
+        return true;
+    }
+
+    void sanitize(const char *where)
+    {
+        const size_t bad = img->sanitize();
+        if (bad && settings->verbose) {
+            printf("WARNING: replaced %zu NaN samples after %s\n", bad, where);
+        }
+    }
+
+    void stage_denoise()
+    {
+        procparams::ProcParams &params = job.pparams;
+        ImProcFunctions &ipf = *(ipf_p.get());
+
+        bool converted = false;
+        if (params.filmNegative.colorSpace != FilmNegativeParams::ColorSpace::INPUT) {
+            imgsrc->convertColorSpace(img, params.icm, currWB);
+            converted = true;
+        }
+
+        if (params.filmNegative.enabled) {
+            FilmNegativeParams copy = params.filmNegative;
+            ipf.filmNegativeProcess(img, img, copy, params.raw, imgsrc, currWB);
+        }
+
+        if (!converted) {
+            imgsrc->convertColorSpace(img, params.icm, currWB);
+        }
+
+        sanitize("input");
+
+        if (params.denoise.enabled) {
+            ipf.denoise(imgsrc, currWB, img, params.denoise);
+        }
+    }
+
+    void stage_transform()
+    {
+        procparams::ProcParams &params = job.pparams;
+        ImProcFunctions &ipf = *(ipf_p.get());
+
+        sanitize("denoise");
+
+        LUTu hist16(65536);
+        ipf.firstAnalysis(img, params, hist16);
+
+        stop = ipf.process(ImProcFunctions::Stage::STAGE_0, img);
+
+        if (ipf.needsTransform()) {
+            if (params.distortion.enabled && params.distortion.autocompute) {
+                params.distortion.amount = ImProcFunctions::getAutoDistor(imgsrc->getFileName(), 400);
+            }
+
+            Imagefloat *trImg = nullptr;
+            if (ipf.needsLuminanceOnly()) {
+                trImg = img;
+            } else {
+                trImg = new Imagefloat(fw, fh, img);
+            }
+            ipf.transform(img, trImg, 0, 0, 0, 0, fw, fh, fw, fh, imgsrc->getMetaData(), imgsrc->getRotateDegree(),
+                          true);
+            if (trImg != img) {
+                delete img;
+                img = trImg;
+            }
+        }
+    }
+
+    Imagefloat *stage_finish(bool is_fast)
+    {
+        procparams::ProcParams &params = job.pparams;
+        ImProcFunctions &ipf = *(ipf_p.get());
+
+        int cx = 0, cy = 0, cw = img->getWidth(), ch = img->getHeight();
+        if (params.crop.enabled) {
+            int iw = img->getWidth();
+            int ih = img->getHeight();
+
+            cx = params.crop.x * scale_factor + 0.5;
+            cy = params.crop.y * scale_factor + 0.5;
+            cw = std::min(int(params.crop.w * scale_factor + 0.5), iw - cx);
+            ch = std::min(int(params.crop.h * scale_factor + 0.5), ih - cy);
+
+            ipf.setViewport(cx, cy, iw, ih);
+
+            Imagefloat *tmpimg = new Imagefloat(cw, ch, img);
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+            for (int row = 0; row < ch; row++) {
+                for (int col = 0; col < cw; col++) {
+                    tmpimg->r(row, col) = img->r(row + cy, col + cx);
+                    tmpimg->g(row, col) = img->g(row + cy, col + cx);
+                    tmpimg->b(row, col) = img->b(row + cy, col + cx);
+                }
+            }
+
+            delete img;
+            img = tmpimg;
+        }
+
+        DCPProfile::ApplyState as;
+        DCPProfile *dcpProf = imgsrc->getDCP(params.icm, as);
+
+        ipf.setDCPProfile(dcpProf, as);
+        stop = stop || ipf.process(ImProcFunctions::Stage::STAGE_1, img);
+        if (stopped()) {
+            return nullptr;
+        }
+        stop = stop || ipf.process(ImProcFunctions::Stage::STAGE_2, img);
+        stop = stop || ipf.process(ImProcFunctions::Stage::STAGE_3, img);
+        if (stopped()) {
+            return nullptr;
+        }
+
+        if (params.resize.enabled) {
+            if (!is_fast) {
+                int imw, imh;
+                double scale = ipf.resizeScale(&params, fw, fh, imw, imh);
+                bool allow_upscaling = params.resize.allowUpscaling || params.resize.dataspec == 0;
+                if (scale < 1.0 || (scale > 1.0 && allow_upscaling)) {
+                    Imagefloat *resized = new Imagefloat(imw, imh, img);
+                    ipf.Lanczos(img, resized, scale);
+                    delete img;
+                    img = resized;
+                }
+            }
+        }
+        if (params.prsharpening.enabled) {
+            ipf.setScale(1);
+            ipf.prsharpening(img);
+        }
+
+        sanitize("pipeline");
+
+        Imagefloat *readyImg = ipf.rgb2out(img, params.icm);
+
+        delete img;
+        img = nullptr;
+
+        Exiv2Metadata info(imgsrc->getFileName());
+        switch (params.metadata.mode) {
+        case MetaDataParams::TUNNEL:
+            readyImg->setMetadata(info);
+            break;
+        case MetaDataParams::EDIT: {
+            auto exifpairs = params.metadata.exif;
+            if (params.resize.enabled && params.resize.copyPPIToExif) {
+                const Glib::ustring val = Glib::ustring::format(params.resize.ppi) + "/1";
+                exifpairs["Exif.Image.XResolution"] = val;
+                exifpairs["Exif.Image.YResolution"] = val;
+                exifpairs["Exif.Image.ResolutionUnit"] = "2";
+            }
+            info.setExif(exifpairs);
+            info.setIptc(params.metadata.iptc);
+            if (!(params.metadata.exifKeys.size() == 1 && params.metadata.exifKeys[0] == "*")) {
+                info.setExifKeys(&(params.metadata.exifKeys));
+            }
+            info.setOutputRating(params, art::gui::options.thumbnail_rating_mode !=
+                                             art::gui::Options::ThumbnailRatingMode::PROCPARAMS);
+            readyImg->setMetadata(info);
+        } break;
+        default:
+            break;
+        }
+
+        if (params.icm.outputProfile != "" && params.icm.outputProfile != ColorManagementParams::NoICMString &&
+            params.icm.outputProfile != ColorManagementParams::NoProfileString) {
+            cmsHPROFILE jprof = ICCStore::getInstance()->getProfile(params.icm.outputProfile);
+            if (jprof != nullptr) {
+                ProfileContent pc = ICCStore::getInstance()->getContent(params.icm.outputProfile);
+                readyImg->setOutputProfile(pc.getData().c_str(), pc.getData().size());
+            }
+        } else if (params.icm.outputProfile == ColorManagementParams::NoProfileString) {
+            cmsHPROFILE wp = ICCStore::getInstance()->workingSpace(params.icm.workingProfile);
+            ProfileContent wpc(wp);
+            readyImg->setOutputProfile(wpc.getData().c_str(), wpc.getData().size());
+        } else {
+            readyImg->setOutputProfile(nullptr, 0);
+        }
+
+        return readyImg;
+    }
+
+    void stage_early_resize()
+    {
+        procparams::ProcParams &params = job.pparams;
+        ImProcFunctions &ipf = *(ipf_p.get());
+
+        if (scale_factor == 1.f) {
+            return;
+        }
+
+        int imw = fw * scale_factor + 0.5;
+        int imh = fh * scale_factor + 0.5;
+
+        bool allow_upscaling = params.resize.allowUpscaling || params.resize.dataspec == 0;
+        if (allow_upscaling || (imw <= fw && imh <= fh)) {
+            Imagefloat *resized = new Imagefloat(imw, imh, img);
+            ipf.Lanczos(img, resized, scale_factor);
+            delete img;
+            img = resized;
+        }
+
+        fw = imw;
+        fh = imh;
+    }
+
+    void adjust_procparams(double scale_factor)
+    {
+        procparams::ProcParams &params = job.pparams;
+        ImProcFunctions &ipf = *(ipf_p.get());
+        ipf.setScale(1.0 / scale_factor);
+
+        if (params.raw.xtranssensor.method == procparams::RAWParams::XTransSensor::Method::THREE_PASS) {
+            params.raw.xtranssensor.method = procparams::RAWParams::XTransSensor::Method::ONE_PASS;
+        }
+
+        if (params.raw.bayersensor.method == procparams::RAWParams::BayerSensor::Method::PIXELSHIFT) {
+            params.raw.bayersensor.method = procparams::RAWParams::BayerSensor::Method::AMAZE;
+        }
+    }
+
+    ProcessingJobImpl &job;
+    Kept &kept;
+    const std::atomic<bool> &cancel;
+    Times &times;
+    int &errorCode;
+
+    std::unique_ptr<ImProcFunctions> ipf_p;
+    InitialImage *ii = nullptr;
+    ImageSource *imgsrc = nullptr;
+    int fw = 0;
+    int fh = 0;
+    double scale_factor = 1.0;
+    int tr = 0;
+    PreviewProps pp = PreviewProps(0, 0, 0, 0, 0);
+    ColorTemp currWB;
+    Imagefloat *img = nullptr;
+    bool stop = false;
+};
+
+} // namespace sb
+}} // namespace art::engine
+
+// ---- the photos kept, and ART-cli's arguments ----
+
+using namespace art::gui;
+namespace pp = art::engine::procparams;
+
+namespace {
+
+typedef std::unique_ptr<pp::PartialProfile> PartialProfile;
+
+bool check_partial_profile(const PartialProfile &p)
 {
-    auto dot = f.find_last_of('.');
-    return dot == Glib::ustring::npos ? "" : f.substr(dot + 1).lowercase();
+    pp::ProcParams params;
+    return p->applyTo(params);
 }
 
-bool isPicture(const Glib::ustring &f)
+Glib::ustring getExtension(const Glib::ustring &filename)
 {
-    auto ext = extensionOf(f);
-    return ext == "jpg" || ext == "jpeg" || ext == "tif" || ext == "tiff" || ext == "png" ||
-           art::engine::ImageIOManager::getInstance()->canLoad(ext);
+    Glib::ustring::size_type lastdot = filename.find_last_of('.');
+    if (lastdot != Glib::ustring::npos) {
+        return filename.substr(lastdot + 1);
+    }
+    return "";
+}
+
+/** One photo loaded (with its raw steps' result in ART's image source). */
+struct KeptPhoto {
+    Glib::ustring path;
+    gint64 mtime = 0;
+    goffset size = 0;
+    bool isRaw = true;
+    art::engine::InitialImage *ii = nullptr;
+    art::engine::sb::Kept kept;
+    Clock::time_point used;
+};
+
+class Photos {
+public:
+    explicit Photos(size_t keep) : keep_(std::max<size_t>(1, keep)) {}
+
+    ~Photos()
+    {
+        for (auto &k : kept_) {
+            k->ii->decreaseRef();
+        }
+    }
+
+    /** The photo, loaded (or kept from before and unchanged on disk); null: it couldn't be loaded. */
+    KeptPhoto *get(const Glib::ustring &path, bool isRaw, bool &reused, int &errorCode)
+    {
+        gint64 mtime = -1;
+        goffset size = -1;
+        try {
+            auto info = Gio::File::create_for_path(path)->query_info("time::modified,time::modified-usec,standard::size");
+            mtime = gint64(info->get_attribute_uint64("time::modified")) * 1000000 +
+                    info->get_attribute_uint32("time::modified-usec");
+            size = info->get_size();
+        } catch (Glib::Exception &) {
+            mtime = -1;   // (not known: never taken for the same file again)
+        }
+        for (size_t i = 0; i < kept_.size(); ++i) {
+            auto &k = kept_[i];
+            if (k->path == path && k->isRaw == isRaw) {
+                if (mtime >= 0 && k->mtime == mtime && k->size == size) {
+                    k->used = Clock::now();
+                    reused = true;
+                    return k.get();
+                }
+                k->ii->decreaseRef();
+                kept_.erase(kept_.begin() + i);
+                break;
+            }
+        }
+        reused = false;
+        errorCode = 0;
+        auto ii = art::engine::InitialImage::load(path, isRaw, &errorCode, nullptr);
+        if (!ii) {
+            return nullptr;
+        }
+        while (kept_.size() >= keep_) {
+            size_t oldest = 0;
+            for (size_t i = 1; i < kept_.size(); ++i) {
+                if (kept_[i]->used < kept_[oldest]->used) {
+                    oldest = i;
+                }
+            }
+            kept_[oldest]->ii->decreaseRef();
+            kept_.erase(kept_.begin() + oldest);
+        }
+        auto k = std::unique_ptr<KeptPhoto>(new KeptPhoto());
+        k->path = path;
+        k->mtime = mtime;
+        k->size = size;
+        k->isRaw = isRaw;
+        k->ii = ii;
+        k->used = Clock::now();
+        kept_.push_back(std::move(k));
+        return kept_.back().get();
+    }
+
+    /** Every photo let go (after an error part way: what was kept may be half changed). */
+    void clear()
+    {
+        for (auto &k : kept_) {
+            k->ii->decreaseRef();
+        }
+        kept_.clear();
+    }
+
+private:
+    size_t keep_;
+    std::vector<std::unique_ptr<KeptPhoto>> kept_;
+};
+
+struct Result {
+    int code = 0;
+    std::string message;
+    double load = 0, raw = 0, develop = 0, save = 0;
+    bool photoReused = false, rawReused = false, earlyReused = false;
+};
+
+const int Unsupported = 99;
+const int Stopped = 98;
+
+/** One ART-cli run (its arguments as StopBath gives them), done here: the same settings, pipeline and files. */
+Result runCli(const std::vector<Glib::ustring> &args, Photos &photos, const std::atomic<bool> &cancel,
+              bool anyExtension = false)
+{
+    Result res;
+    auto fail = [&](int code, const std::string &msg) {
+        res.code = code;
+        res.message = msg;
+        return res;
+    };
+
+    std::vector<Glib::ustring> inputFiles;
+    std::vector<PartialProfile> processingParams;
+    Glib::ustring outputPath;
+    bool overwriteFiles = false, copyParamsFile = false, useDefault = false, fast = false;
+    int compression = 92, subsampling = 3, bits = -1;
+    bool isFloat = false;
+    std::string outputType;
+
+    for (size_t i = 0; i < args.size(); ++i) {
+        const Glib::ustring &a = args[i];
+        if (a.empty()) {
+            continue;
+        }
+        if (a[0] != '-' || a.size() < 2) {
+            return fail(Unsupported, "unexpected argument: " + a);
+        }
+        switch (a[1]) {
+        case 'O':
+            copyParamsFile = true;
+            // fall through
+        case 'o':
+            if (i + 1 >= args.size()) {
+                return fail(Unsupported, "-o without a file");
+            }
+            outputPath = args[++i];
+            if (Glib::file_test(outputPath, Glib::FILE_TEST_IS_DIR) || outputPath.substr(0, 9) == "/dev/null") {
+                return fail(Unsupported, "output to a folder");
+            }
+            break;
+        case 'p': {
+            if (i + 1 >= args.size()) {
+                return fail(Unsupported, "-p without a file");
+            }
+            Glib::ustring fname = args[++i];
+            PartialProfile current(new pp::FilePartialProfile(nullptr, fname, false));
+            if (!check_partial_profile(current)) {
+                return fail(-3, "Error: \"" + fname + "\" not found.");
+            }
+            processingParams.push_back(std::move(current));
+        } break;
+        case 'd':
+            useDefault = true;
+            break;
+        case 'q':
+        case 'V':
+            break;
+        case 'Y':
+            overwriteFiles = true;
+            break;
+        case 'j':
+            if (a.size() > 2 && a[2] == 's') {
+                subsampling = atoi(a.substr(3).c_str());
+                if (subsampling < 1 || subsampling > 3) {
+                    return fail(-3, "Error: the value accompanying the -js switch has to be in the [1-3] range!");
+                }
+            } else {
+                outputType = "jpg";
+                compression = a.size() < 3 ? 92 : atoi(a.substr(2).c_str());
+                if (compression < 0 || compression > 100) {
+                    return fail(-3, "Error: the value accompanying the -j switch has to be in the [0-100] range!");
+                }
+            }
+            break;
+        case 'b':
+            bits = -1;
+            if (a.size() >= 3 && a[2] == '8') {
+                bits = 8;
+            } else if (a.size() >= 4 && a.size() <= 5 && a[2] == '1' && a[3] == '6') {
+                bits = 16;
+                isFloat = a.size() == 5 && a[4] == 'f';
+            } else if (a.size() >= 4 && a.size() <= 5 && a[2] == '3' && a[3] == '2') {
+                bits = 32;
+                isFloat = true;
+            }
+            if (bits == -1) {
+                return fail(-3, "Error: specify output bit depth per channel as -b8, -b16, -b16f or -b32.");
+            }
+            break;
+        case 't':
+            outputType = "tif";
+            compression = (a.size() < 3 || a[2] != 'z') ? 0 : 1;
+            break;
+        case 'n':
+            outputType = "png";
+            compression = -1;
+            break;
+        case 'f':
+            fast = true;
+            break;
+        case 'c':
+            for (++i; i < args.size(); ++i) {
+                inputFiles.push_back(args[i]);
+            }
+            break;
+        default:
+            return fail(Unsupported, "not done by the helper: " + a);
+        }
+    }
+
+    if (inputFiles.size() != 1) {
+        return fail(Unsupported, "one photo at a time");
+    }
+    const Glib::ustring inputFile = inputFiles[0];
+    if (!Glib::file_test(inputFile, Glib::FILE_TEST_IS_REGULAR)) {
+        return fail(2, "\"" + inputFile + "\" doesn't exist!");
+    }
+    if (!anyExtension && !options.has_retained_extention(inputFile)) {
+        return fail(2, "\"" + inputFile + "\" is not one of the selected parsed extensions. Image skipped.");
+    }
+
+    if (bits == -1) {
+        bits = outputType == "jpg" || outputType == "png" ? 8 : outputType == "tif" ? 16 : 32;
+    }
+    if (outputType.empty()) {
+        outputType = "jpg";
+    }
+
+    std::unordered_map<std::string, Glib::ustring> output_ext;
+    for (auto &p : art::engine::ImageIOManager::getInstance()->getSaveFormats()) {
+        output_ext[p.first] = p.second.extension;
+    }
+    output_ext["jpg"] = "jpg";
+    output_ext["tif"] = "tif";
+    output_ext["png"] = "png";
+    auto oext = output_ext[outputType];
+    if (oext.empty()) {
+        oext = outputType;
+    }
+
+    Glib::ustring outputFile;
+    if (outputPath.empty()) {
+        outputFile = inputFile.substr(0, inputFile.find_last_of('.')) + "." + oext;
+    } else {
+        outputFile = outputPath.substr(0, outputPath.find_last_of('.')) + "." + oext;
+    }
+    if (inputFile == outputFile) {
+        return fail(0, "cannot overwrite: " + inputFile);
+    }
+    if (!overwriteFiles && Glib::file_test(outputFile, Glib::FILE_TEST_EXISTS)) {
+        return fail(0, outputFile + " already exists: use -Y option to overwrite. This image has been skipped.");
+    }
+
+    PartialProfile rawParams, imgParams;
+    if (useDefault) {
+        Glib::ustring profPath = options.findProfilePath(options.defProfRaw);
+        if (profPath == Options::DEFPROFILE_INTERNAL) {
+            rawParams.reset(new pp::FullPartialProfile());
+        } else {
+            Glib::ustring fname =
+                Glib::build_filename(profPath, Glib::path_get_basename(options.defProfRaw) + paramFileExtension);
+            rawParams.reset(new pp::FilePartialProfile(nullptr, fname, false));
+        }
+        if (options.is_defProfRawMissing() || profPath.empty() ||
+            (profPath != Options::DEFPROFILE_DYNAMIC && !check_partial_profile(rawParams))) {
+            return fail(-3, "Error: default raw processing profile not found.");
+        }
+        profPath = options.findProfilePath(options.defProfImg);
+        if (profPath == Options::DEFPROFILE_INTERNAL) {
+            imgParams.reset(new pp::FullPartialProfile());
+        } else {
+            auto fname =
+                Glib::build_filename(profPath, Glib::path_get_basename(options.defProfImg) + paramFileExtension);
+            imgParams.reset(new pp::FilePartialProfile(nullptr, fname, false));
+        }
+        if (options.is_defProfImgMissing() || profPath.empty() ||
+            (profPath != Options::DEFPROFILE_DYNAMIC && !check_partial_profile(imgParams))) {
+            return fail(-3, "Error: default non-raw processing profile not found.");
+        }
+    }
+
+    Glib::ustring ext = getExtension(inputFile).lowercase();
+    bool isRaw = !(ext == "jpg" || ext == "jpeg" || ext == "tif" || ext == "tiff" || ext == "png" ||
+                   art::engine::ImageIOManager::getInstance()->canLoad(ext));
+
+    auto t0 = Clock::now();
+    int errorCode = 0;
+    KeptPhoto *photo = photos.get(inputFile, isRaw, res.photoReused, errorCode);
+    res.load = ms(t0, Clock::now());
+    if (!photo) {
+        return fail(-2, "impossible to load file: " + inputFile);
+    }
+    if (cancel.load()) {
+        return fail(Stopped, "stopped");
+    }
+
+    pp::ProcParams currentParams;
+    if (useDefault) {
+        if (isRaw) {
+            if (options.defProfRaw == Options::DEFPROFILE_DYNAMIC) {
+                rawParams = art::engine::ProfileStore::getInstance()->loadDynamicProfile(photo->ii->getMetaData());
+            }
+            rawParams->applyTo(currentParams);
+        } else {
+            if (options.defProfImg == Options::DEFPROFILE_DYNAMIC) {
+                imgParams = art::engine::ProfileStore::getInstance()->loadDynamicProfile(photo->ii->getMetaData());
+            }
+            imgParams->applyTo(currentParams);
+        }
+    }
+    for (auto &p : processingParams) {
+        p->applyTo(currentParams);
+    }
+    if (auto p = art::engine::ImageIOManager::getInstance()->getSaveProfile(outputType)) {
+        p->applyTo(currentParams);
+    }
+
+    std::unique_ptr<art::engine::ProcessingJobImpl> job(
+        static_cast<art::engine::ProcessingJobImpl *>(create_processing_job(photo->ii, currentParams, fast)));
+    if (!job) {
+        return fail(-2, "impossible to create processing job for: " + inputFile);
+    }
+
+    art::engine::sb::Times times;
+    art::engine::Imagefloat *resultImage = nullptr;
+    {
+        art::engine::sb::Processor proc(*job, photo->kept, cancel, times, errorCode);
+        resultImage = proc();
+    }
+    job.reset();
+    res.raw = times.raw;
+    res.develop = times.develop;
+    res.rawReused = times.rawReused;
+    res.earlyReused = times.earlyReused;
+    if (!resultImage) {
+        if (errorCode == art::engine::sb::STOPPED) {
+            return fail(Stopped, "stopped");
+        }
+        return fail(-2, "failure in processing: " + inputFile);
+    }
+
+    auto s0 = Clock::now();
+    if (outputType == "jpg") {
+        errorCode = resultImage->saveAsJPEG(outputFile, compression, subsampling);
+    } else if (outputType == "tif") {
+        errorCode = resultImage->saveAsTIFF(outputFile, bits, isFloat, compression == 0);
+    } else if (outputType == "png") {
+        errorCode = resultImage->saveAsPNG(outputFile, bits);
+    } else {
+        errorCode = art::engine::ImageIOManager::getInstance()->save(resultImage, outputType, outputFile, nullptr) ? 0 : 1;
+    }
+    if (errorCode) {
+        resultImage->free();
+        return fail(-2, "failure in saving to: " + outputFile);
+    }
+    if (copyParamsFile) {
+        Glib::ustring outputProcessingParams = outputFile + paramFileExtension;
+        if (!options.params_out_embed || currentParams.saveEmbedded(nullptr, outputFile) != 0) {
+            currentParams.save(nullptr, outputProcessingParams);
+        }
+    }
+    resultImage->free();
+    res.save = ms(s0, Clock::now());
+    return res;
+}
+
+std::string oneLine(std::string s)
+{
+    for (auto &c : s) {
+        if (c == '\n' || c == '\r') {
+            c = ' ';
+        }
+    }
+    return s;
+}
+
+std::mutex sayLock;
+
+void say(const std::string &line)
+{
+    std::lock_guard<std::mutex> lock(sayLock);
+    std::cout.flush();
+    fputs(("\n@@SB " + line + "\n").c_str(), stdout);   // (on a line of its own whatever ART printed last)
+    fflush(stdout);
+}
+
+std::string reusedText(const Result &r)
+{
+    std::string s = r.photoReused ? "photo:kept" : "photo:loaded";
+    s += r.rawReused ? ",raw:reused" : ",raw:made";
+    s += r.earlyReused ? ",small:reused" : "";
+    char t[160];
+    snprintf(t, sizeof(t), ",load:%.0f,raw:%.0f,develop:%.0f,save:%.0f", r.load, r.raw, r.develop, r.save);
+    return s + t;
+}
+
+// ---- serving StopBath ----
+
+struct Request {
+    std::string id;
+    std::vector<Glib::ustring> args;
+    bool quit = false;
+};
+
+std::string trimEnd(std::string s)
+{
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) {
+        s.pop_back();
+    }
+    return s;
+}
+
+int serve(size_t keep)
+{
+    Photos photos(keep);
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<Request> queue;
+    std::string current;
+    std::atomic<bool> cancel(false);
+
+    std::thread reader([&]() {
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            line = trimEnd(line);
+            std::istringstream words(line);
+            std::string verb;
+            words >> verb;
+            if (verb == "run") {
+                Request r;
+                size_t count = 0;
+                words >> r.id >> count;
+                bool complete = true;
+                for (size_t i = 0; i < count; ++i) {
+                    std::string a;
+                    if (!std::getline(std::cin, a)) {
+                        complete = false;
+                        break;
+                    }
+                    r.args.emplace_back(trimEnd(a));
+                }
+                if (!complete) {
+                    break;
+                }
+                std::lock_guard<std::mutex> lock(m);
+                queue.push_back(std::move(r));
+                cv.notify_one();
+            } else if (verb == "cancel") {
+                std::string id;
+                words >> id;
+                std::lock_guard<std::mutex> lock(m);
+                if (id == current) {
+                    cancel.store(true);
+                }
+                for (auto it = queue.begin(); it != queue.end(); ++it) {
+                    if (it->id == id) {
+                        say("done " + id + " " + std::to_string(Stopped) + " 0 - stopped");
+                        queue.erase(it);
+                        break;
+                    }
+                }
+            } else if (verb == "quit") {
+                break;
+            }
+        }
+        // standard input closed or "quit": StopBath has gone
+        std::lock_guard<std::mutex> lock(m);
+        Request q;
+        q.quit = true;
+        queue.push_back(q);
+        cv.notify_one();
+    });
+    reader.detach();
+
+    say(std::string("ready ") + HelperVersion + " " + RTVERSION);
+
+    while (true) {
+        Request r;
+        {
+            std::unique_lock<std::mutex> lock(m);
+            cv.wait(lock, [&]() { return !queue.empty(); });
+            r = std::move(queue.front());
+            queue.pop_front();
+            if (r.quit) {
+                break;
+            }
+            current = r.id;
+            cancel.store(false);
+        }
+        auto t0 = Clock::now();
+        Result res;
+        try {
+            res = runCli(r.args, photos, cancel);
+        } catch (std::exception &e) {
+            res.code = -2;
+            res.message = std::string("error: ") + e.what();
+            photos.clear();
+        } catch (Glib::Exception &e) {
+            res.code = -2;
+            res.message = "error: " + std::string(e.what());
+            photos.clear();
+        } catch (...) {
+            res.code = -2;
+            res.message = "error";
+            photos.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(m);
+            current.clear();
+        }
+        char t[32];
+        snprintf(t, sizeof(t), "%.0f", ms(t0, Clock::now()));
+        say("done " + r.id + " " + std::to_string(res.code) + " " + t + " " + reusedText(res) + " " +
+            oneLine(res.message));
+    }
+    std::_Exit(0);   // (the reader thread may still wait on standard input; ART's engine needs no tidying)
+    return 0;
 }
 
 int render(int argc, char **argv)
 {
     if (argc < 4) {
-        std::cerr << "usage: stopbath-engine --render <photo> <out.jpg> [--profile <file.arp>]... [--fast] [--repeat <n>]" << std::endl;
+        std::cerr << "usage: stopbath-engine --render <photo> <out.jpg> [--profile <file.arp>]... [--fast] [--repeat <n>]"
+                  << std::endl;
         return 2;
     }
-    Glib::ustring photo = argv[2], out = argv[3];
+    std::vector<Glib::ustring> args = {"-o", argv[3], "-j92", "-js3", "-Y"};
     std::vector<Glib::ustring> profiles;
-    bool fast = false;
     int repeat = 1;
     for (int i = 4; i < argc; ++i) {
-        if (!strcmp(argv[i], "--profile") && i + 1 < argc) profiles.push_back(argv[++i]);
-        else if (!strcmp(argv[i], "--fast")) fast = true;
-        else if (!strcmp(argv[i], "--repeat") && i + 1 < argc) repeat = std::max(1, atoi(argv[++i]));
+        if (!strcmp(argv[i], "--profile") && i + 1 < argc) {
+            args.push_back("-p");
+            args.push_back(argv[++i]);
+        } else if (!strcmp(argv[i], "--fast")) {
+            args.push_back("-f");
+        } else if (!strcmp(argv[i], "--repeat") && i + 1 < argc) {
+            repeat = std::max(1, atoi(argv[++i]));
+        }
     }
+    args.push_back("-c");
+    args.push_back(argv[2]);
 
+    Photos photos(1);
+    std::atomic<bool> cancel(false);
     auto t0 = Clock::now();
-    bool raw = !isPicture(photo);
-    int error = 0;
-    art::engine::InitialImage *ii = art::engine::InitialImage::load(photo, raw, &error, nullptr);
-    if (!ii) {
-        std::cerr << "error: the photo couldn't be loaded (" << error << ")" << std::endl;
-        return 3;
-    }
-    auto t1 = Clock::now();
-    std::cout << "loaded " << ms(t0, t1) << " ms" << std::endl;
-
-    art::engine::procparams::ProcParams params;
-    for (auto &p : profiles) {
-        if (params.load(nullptr, p) != 0) {
-            std::cerr << "error: the profile couldn't be read: " << p << std::endl;
-            ii->decreaseRef();
-            return 4;
-        }
-    }
-    if (auto sp = art::engine::ImageIOManager::getInstance()->getSaveProfile("jpg")) sp->applyTo(params);
-
     for (int n = 1; n <= repeat; ++n) {
-        auto a = Clock::now();
-        auto job = create_processing_job(ii, params, fast);
-        if (!job) {
-            std::cerr << "error: no processing job" << std::endl;
-            ii->decreaseRef();
-            return 5;
+        auto res = runCli(args, photos, cancel, true);   // (a test: any picture ART can read)
+        if (res.code != 0 || !res.message.empty()) {
+            std::cerr << res.message << std::endl;
+            if (res.code != 0) {
+                return res.code;
+            }
         }
-        art::engine::IImagefloat *img = art::engine::processImage(job, error, nullptr);
-        if (!img) {
-            std::cerr << "error: the photo couldn't be developed (" << error << ")" << std::endl;
-            ii->decreaseRef();
-            return 6;
-        }
-        auto b = Clock::now();
-        int saved = n == repeat ? img->saveAsJPEG(out, 92, 3) : 0;
-        auto c = Clock::now();
-        std::cout << "developed #" << n << " " << ms(a, b) << " ms" << (n == repeat ? ", saved " + std::to_string((int)ms(b, c)) + " ms" : "") << std::endl;
-        img->free();
-        if (saved != 0) {
-            std::cerr << "error: the picture couldn't be saved" << std::endl;
-            ii->decreaseRef();
-            return 7;
-        }
+        std::cout << "#" << n << ": " << (res.photoReused ? "photo kept" : "loaded " + std::to_string((int)res.load) + " ms")
+                  << ", raw steps " << (res.rawReused ? "reused" : std::to_string((int)res.raw) + " ms")
+                  << (res.earlyReused ? ", small picture reused" : "")
+                  << ", developed " << (int)res.develop << " ms, saved " << (int)res.save << " ms" << std::endl;
     }
-    ii->decreaseRef();
-    std::cout << "total " << ms(t0, Clock::now()) << " ms" << std::endl;
+    std::cout << "total " << (int)ms(t0, Clock::now()) << " ms" << std::endl;
     return 0;
 }
 
@@ -144,6 +1339,10 @@ int main(int argc, char **argv)
     setlocale(LC_ALL, "");
 #endif
     setlocale(LC_NUMERIC, "C");
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
 
     Gio::init();
 
@@ -181,15 +1380,43 @@ int main(int argc, char **argv)
 
     auto started = Clock::now();
     try {
-        Options::load(true, 0);
+        Options::load(false, 0);   // (as ART-cli: everything loaded)
     } catch (Options::Error &e) {
         std::cerr << "error: " << e.get_msg() << std::endl;
         return 1;
     }
+    // as ART-cli: missing default profiles replaced
+    if (options.is_defProfRawMissing()) {
+        options.defProfRaw = Options::DEFPROFILE_RAW;
+    }
+    if (options.is_bundledDefProfRawMissing()) {
+        options.defProfRaw = Options::DEFPROFILE_INTERNAL;
+    }
+    if (options.is_defProfImgMissing()) {
+        options.defProfImg = Options::DEFPROFILE_IMG;
+    }
+    if (options.is_bundledDefProfImgMissing()) {
+        options.defProfImg = Options::DEFPROFILE_INTERNAL;
+    }
     TIFFSetWarningHandler(nullptr);
-    std::cout << "StopBath engine helper " << HelperVersion << " (ART " << RTVERSION << "), started " << ms(started, Clock::now()) << " ms" << std::endl;
 
-    if (argc > 1 && !strcmp(argv[1], "--render")) return render(argc, argv);
-    std::cout << "usage: stopbath-engine --version | --render <photo> <out.jpg> [--profile <file.arp>]... [--fast] [--repeat <n>]" << std::endl;
+    if (argc > 1 && !strcmp(argv[1], "--serve")) {
+        size_t keep = 2;
+        for (int i = 2; i + 1 < argc; ++i) {
+            if (!strcmp(argv[i], "--keep")) {
+                keep = std::max(1, atoi(argv[i + 1]));
+            }
+        }
+        return serve(keep);
+    }
+
+    std::cout << "StopBath engine helper " << HelperVersion << " (ART " << RTVERSION << "), started "
+              << ms(started, Clock::now()) << " ms" << std::endl;
+    if (argc > 1 && !strcmp(argv[1], "--render")) {
+        return render(argc, argv);
+    }
+    std::cout << "usage: stopbath-engine --version | --serve [--keep <n>] | --render <photo> <out.jpg> [--profile "
+                 "<file.arp>]... [--fast] [--repeat <n>]"
+              << std::endl;
     return 0;
 }
