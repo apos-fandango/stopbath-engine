@@ -1,0 +1,13 @@
+# StopBath engine helper: appended to ART's src/gui/CMakeLists.txt by the build (it needs ART-cli's own sources).
+set(STOPBATH_HELPER_SOURCES ${CLISOURCEFILES})
+list(REMOVE_ITEM STOPBATH_HELPER_SOURCES main-cli.cc)
+list(APPEND STOPBATH_HELPER_SOURCES stopbath-engine.cc)
+add_executable(stopbath-engine ${STOPBATH_HELPER_SOURCES})
+add_dependencies(stopbath-engine UpdateInfo)
+target_compile_definitions(stopbath-engine PUBLIC CLIVERSION)
+set_target_properties(stopbath-engine PROPERTIES COMPILE_FLAGS "${CMAKE_CXX_FLAGS}")
+get_target_property(STOPBATH_HELPER_LIBS art-cli LINK_LIBRARIES)
+target_link_libraries(stopbath-engine PUBLIC ${STOPBATH_HELPER_LIBS})
+if(WIN32 OR UNIX)
+    install(TARGETS stopbath-engine DESTINATION ${BINDIR})
+endif()
