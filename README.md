@@ -3,7 +3,13 @@
 A small program built from ART's own processing engine (ART by Alberto Griggio, itself a fork of RawTherapee), for
 the StopBath photo app. StopBath starts it and talks to it; it develops photos the way ART does.
 
-**Version 0.3 (now):** as 0.2, and it also keeps the photo as it is before ART's colour and tone steps (read out of
+**Version 0.4 (now):** as 0.3, and each answer also says how long ART's steps took: ART's own per-step timing
+(`ART_PROFILE`, switched on by the helper; two clock readings a step), with the helper's own steps (reading the
+picture out, noise reduction, the lens corrections, the output colours...) named `sb.*`. The answer's `<what was
+reused>` ends with `,steps:<name>=<ms>;<name>=<ms>...`, slowest first. The build uses the GitHub actions' newer
+versions (Node.js 24). Pictures are still ART-cli's, pixel for pixel.
+
+**Version 0.3:** as 0.2, and it also keeps the photo as it is before ART's colour and tone steps (read out of
 the raw steps, in the working colours, denoised, its spots, dehaze and lens corrections done) for the last photo: a
 change of exposure, colour or tone, or the second of a film's two pictures, starts from there - as ART's own editor
 does. `-R` writes a picture as three planes of 32-bit numbers ("SBRF", width, height, 3, then red, green and blue),

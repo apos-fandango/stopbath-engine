@@ -7,7 +7,8 @@
  *  later settings changed. 0.3: also the photo as it is before ART's colour and tone steps (read out of the raw steps,
  *  in the working colours, denoised, its spots, dehaze and lens corrections done) is kept for the last photo, so a
  *  change of exposure, colour or tone - or the second of a film's two pictures - starts from there; and "-R" writes a
- *  picture as three planes of 32-bit numbers (StopBath's film reads it at once):
+ *  picture as three planes of 32-bit numbers (StopBath's film reads it at once). 0.4: each answer also says how long
+ *  ART's steps took (ART's own per-step timing):
  *
  *    stopbath-engine --version
  *    stopbath-engine --serve [--keep <n>]
@@ -19,6 +20,8 @@
  *        answers on standard output (other lines there are ART's own and can be ignored):
  *          @@SB ready <helper version> <ART version>
  *          @@SB done <id> <exit code> <ms> <what was reused> <message>
+ *        (0.4: <what was reused> ends with ",steps:" and ART's steps that took a millisecond or more, slowest first:
+ *        <name>=<ms>, joined by ";" - ART's own per-step timing, ART_PROFILE, switched on here)
  *        exit code 0: done as ART-cli would; 99: not something the helper does (use ART-cli); 98: stopped
  *    stopbath-engine --render <photo> <out.jpg> [--profile <file.arp>]... [--fast] [--repeat <n>]
  *        times one photo, developed n times in one go (step 1's test)
@@ -39,6 +42,7 @@
 #include "../engine/improcfun.h"
 #include "../engine/metadata.h"
 #include "../engine/processingjob.h"
+#include "../engine/pipelineprofile.h"
 #include "../engine/procparams.h"
 #include "../engine/profilestore.h"
 #include "../engine/rawimagesource.h"
@@ -49,7 +53,9 @@
 #include "../utils/version.h"
 #include "fastexport.h"
 #include "options.h"
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -58,6 +64,7 @@
 #include <deque>
 #include <giomm.h>
 #include <iostream>
+#include <sstream>
 #include <locale.h>
 #include <memory>
 #include <mutex>
@@ -88,7 +95,7 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-const char *HelperVersion = "0.3";
+const char *HelperVersion = "0.4";
 
 double ms(Clock::time_point a, Clock::time_point b)
 {
@@ -480,7 +487,7 @@ private:
 
         if (params.wb.method == WBParams::AUTO) {
             double rm, gm, bm;
-            imgsrc->getAutoWBMultipliers(rm, gm, bm);
+            { ART_PROFILE_SCOPE("sb.autoWB"); imgsrc->getAutoWBMultipliers(rm, gm, bm); }
             if (rm != -1.) {
                 if (params.wb.equal == 1) {
                     currWB = ColorTemp(rm, gm, bm);
@@ -520,7 +527,7 @@ private:
             }
             kept.dnKey = dkey;
             kept.dnKey.valid = false;   // (until it has been measured)
-            ipf.denoiseComputeParams(imgsrc, currWB, kept.dn, params.denoise);
+            { ART_PROFILE_SCOPE("sb.denoiseParams"); ipf.denoiseComputeParams(imgsrc, currWB, kept.dn, params.denoise); }
             kept.dnKey.valid = kept.dn.valid;
         }
 
@@ -547,21 +554,23 @@ private:
         }
         if (midHit) {
             midHit->used = ++kept.midClock;
-            img = midHit->img->copy();
+            { ART_PROFILE_SCOPE("sb.keptCopy"); img = midHit->img->copy(); }
             fw = midHit->fw;
             fh = midHit->fh;
             // (what these steps work out for the later ones, from the image source: as below)
             if (params.toneCurve.histmatching) {
                 if (!params.toneCurve.fromHistMatching) {
-                    imgsrc->getAutoMatchedToneCurve(params.icm, params.toneCurve.curve, params.toneCurve.curve2);
+                    { ART_PROFILE_SCOPE("sb.autoToneCurve"); imgsrc->getAutoMatchedToneCurve(params.icm, params.toneCurve.curve, params.toneCurve.curve2); }
                 }
             }
             if (params.logenc.enabled && params.logenc.autocompute) {
-                ipf.getAutoLog(imgsrc, params.logenc);
+                { ART_PROFILE_SCOPE("sb.autoLog"); ipf.getAutoLog(imgsrc, params.logenc); }
             }
             if (params.sharpening.enabled && params.sharpening.deconvAutoRadius) {
                 float r = 0.f;
-                if (imgsrc->getDeconvAutoRadius(&r)) {
+                bool gotRadius = false;
+                { ART_PROFILE_SCOPE("sb.autoDeconv"); gotRadius = imgsrc->getDeconvAutoRadius(&r); }
+                if (gotRadius) {
                     params.sharpening.deconvradius = r;
                 }
             }
@@ -596,24 +605,26 @@ private:
         // is done, as below for the steps that follow)
         bool reuse = is_fast && kept.earlyImg && ekey.same(kept.early);
         if (reuse) {
-            img = kept.earlyImg->copy();
+            { ART_PROFILE_SCOPE("sb.keptCopy"); img = kept.earlyImg->copy(); }
         } else {
             img = new Imagefloat(fw, fh);
-            imgsrc->getImage(currWB, tr, img, pp, params.exposure, params.raw);
+            { ART_PROFILE_SCOPE("sb.getImage"); imgsrc->getImage(currWB, tr, img, pp, params.exposure, params.raw); }
         }
         img->assignColorSpace(params.icm.workingProfile);
 
         if (params.toneCurve.histmatching) {
             if (!params.toneCurve.fromHistMatching) {
-                imgsrc->getAutoMatchedToneCurve(params.icm, params.toneCurve.curve, params.toneCurve.curve2);
+                { ART_PROFILE_SCOPE("sb.autoToneCurve"); imgsrc->getAutoMatchedToneCurve(params.icm, params.toneCurve.curve, params.toneCurve.curve2); }
             }
         }
         if (params.logenc.enabled && params.logenc.autocompute) {
-            ipf.getAutoLog(imgsrc, params.logenc);
+            { ART_PROFILE_SCOPE("sb.autoLog"); ipf.getAutoLog(imgsrc, params.logenc); }
         }
         if (params.sharpening.enabled && params.sharpening.deconvAutoRadius) {
             float r = 0.f;
-            if (imgsrc->getDeconvAutoRadius(&r)) {
+            bool gotRadius = false;
+            { ART_PROFILE_SCOPE("sb.autoDeconv"); gotRadius = imgsrc->getDeconvAutoRadius(&r); }
+            if (gotRadius) {
                 params.sharpening.deconvradius = r;
             }
         }
@@ -626,14 +637,14 @@ private:
         }
 
         if (params.spot.enabled && !params.spot.entries.empty()) {
-            ipf.removeSpots(img, imgsrc, params.spot.entries, pp, currWB, nullptr, tr, nullptr);
+            { ART_PROFILE_SCOPE("sb.spots"); ipf.removeSpots(img, imgsrc, params.spot.entries, pp, currWB, nullptr, tr, nullptr); }
         }
         if (is_fast) {
             if (stopped()) {
                 return false;
             }
             kept.early.valid = false;
-            stage_early_resize();
+            { ART_PROFILE_SCOPE("sb.earlyResize"); stage_early_resize(); }
             kept.early = ekey;
             kept.early.outW = fw;
             kept.early.outH = fh;
@@ -658,7 +669,7 @@ private:
 
         bool converted = false;
         if (params.filmNegative.colorSpace != FilmNegativeParams::ColorSpace::INPUT) {
-            imgsrc->convertColorSpace(img, params.icm, currWB);
+            { ART_PROFILE_SCOPE("sb.colourIn"); imgsrc->convertColorSpace(img, params.icm, currWB); }
             converted = true;
         }
 
@@ -668,13 +679,13 @@ private:
         }
 
         if (!converted) {
-            imgsrc->convertColorSpace(img, params.icm, currWB);
+            { ART_PROFILE_SCOPE("sb.colourIn"); imgsrc->convertColorSpace(img, params.icm, currWB); }
         }
 
         sanitize("input");
 
         if (params.denoise.enabled) {
-            ipf.denoise(imgsrc, currWB, img, params.denoise);
+            { ART_PROFILE_SCOPE("sb.denoise"); ipf.denoise(imgsrc, currWB, img, params.denoise); }
         }
     }
 
@@ -686,11 +697,12 @@ private:
         sanitize("denoise");
 
         LUTu hist16(65536);
-        ipf.firstAnalysis(img, params, hist16);
+        { ART_PROFILE_SCOPE("sb.firstAnalysis"); ipf.firstAnalysis(img, params, hist16); }
 
         stop = ipf.process(ImProcFunctions::Stage::STAGE_0, img);
 
         if (ipf.needsTransform()) {
+            ART_PROFILE_SCOPE("sb.transform");
             if (params.distortion.enabled && params.distortion.autocompute) {
                 params.distortion.amount = ImProcFunctions::getAutoDistor(imgsrc->getFileName(), 400);
             }
@@ -716,7 +728,7 @@ private:
         procparams::ProcParams &params = job.pparams;
         ImProcFunctions &ipf = *(ipf_p.get());
         LUTu hist16(65536);
-        ipf.firstAnalysis(img, params, hist16);
+        { ART_PROFILE_SCOPE("sb.firstAnalysis"); ipf.firstAnalysis(img, params, hist16); }
         stop = midHit->stop;
         (void)params;   // (the automatic distortion is only read by the transform: not worked out again)
     }
@@ -742,7 +754,7 @@ private:
         }
         Kept::Mid m;
         img->syncCpu();   // (kept in the computer's memory: copied there, not on the graphics card)
-        m.img.reset(img->copy());
+        { ART_PROFILE_SCOPE("sb.keep"); m.img.reset(img->copy()); }
         m.fw = fw;
         m.fh = fh;
         m.stop = stop;
@@ -758,6 +770,7 @@ private:
 
         int cx = 0, cy = 0, cw = img->getWidth(), ch = img->getHeight();
         if (params.crop.enabled) {
+            ART_PROFILE_SCOPE("sb.crop");
             int iw = img->getWidth();
             int ih = img->getHeight();
 
@@ -805,7 +818,7 @@ private:
                 bool allow_upscaling = params.resize.allowUpscaling || params.resize.dataspec == 0;
                 if (scale < 1.0 || (scale > 1.0 && allow_upscaling)) {
                     Imagefloat *resized = new Imagefloat(imw, imh, img);
-                    ipf.Lanczos(img, resized, scale);
+                    { ART_PROFILE_SCOPE("sb.resize"); ipf.Lanczos(img, resized, scale); }
                     delete img;
                     img = resized;
                 }
@@ -813,16 +826,18 @@ private:
         }
         if (params.prsharpening.enabled) {
             ipf.setScale(1);
-            ipf.prsharpening(img);
+            { ART_PROFILE_SCOPE("sb.prsharpening"); ipf.prsharpening(img); }
         }
 
         sanitize("pipeline");
 
-        Imagefloat *readyImg = ipf.rgb2out(img, params.icm);
+        Imagefloat *readyImg = nullptr;
+        { ART_PROFILE_SCOPE("sb.rgb2out"); readyImg = ipf.rgb2out(img, params.icm); }
 
         delete img;
         img = nullptr;
 
+        ART_PROFILE_SCOPE("sb.metadata");   // (to the end: the metadata and the output profile)
         Exiv2Metadata info(imgsrc->getFileName());
         switch (params.metadata.mode) {
         case MetaDataParams::TUNNEL:
@@ -1056,6 +1071,7 @@ private:
 struct Result {
     int code = 0;
     std::string message;
+    std::string steps;   // 0.4: ART's steps' times (see stepTimes)
     double load = 0, raw = 0, develop = 0, save = 0;
     bool photoReused = false, rawReused = false, earlyReused = false, midReused = false;
 };
@@ -1408,7 +1424,52 @@ std::string reusedText(const Result &r)
     s += r.midReused ? ",mid:reused" : "";
     char t[160];
     snprintf(t, sizeof(t), ",load:%.0f,raw:%.0f,develop:%.0f,save:%.0f", r.load, r.raw, r.develop, r.save);
-    return s + t;
+    return s + t + (r.steps.empty() ? "" : ",steps:" + r.steps);
+}
+
+/** 0.4: ART's steps' times since the last call (ART's per-step timing, read from its table and emptied), slowest
+ *  first, those of a millisecond or more, as name=ms;name=ms. ART's own names with ":" (the parts of noise reduction)
+ *  are left out: they are inside "sb.denoise". */
+std::string stepTimes()
+{
+    std::ostringstream table;
+    std::ios format(nullptr);
+    format.copyfmt(std::cerr);   // (the table's number format isn't left on standard error)
+    std::streambuf *was = std::cerr.rdbuf(table.rdbuf());
+    try {
+        art::engine::PipelineProfile::report("");
+    } catch (...) {
+    }
+    std::cerr.rdbuf(was);
+    std::cerr.copyfmt(format);
+    std::vector<std::pair<std::string, double>> v;
+    std::istringstream in(table.str());
+    std::string line;
+    while (std::getline(in, line)) {
+        std::istringstream ls(line);
+        std::string name;
+        double msTook = 0, pct = 0, cum = 0;
+        long calls = 0;
+        if (!(ls >> name >> msTook >> pct >> cum >> calls) || name.find(':') != std::string::npos || msTook < 1) {
+            continue;
+        }
+        for (auto &c : name) {
+            if (!(isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-')) {
+                c = '_';
+            }
+        }
+        v.emplace_back(name, msTook);
+    }
+    std::sort(v.begin(), v.end(), [](const std::pair<std::string, double> &a, const std::pair<std::string, double> &b) {
+        return a.second > b.second;
+    });
+    std::string out;
+    char t[64];
+    for (size_t i = 0; i < v.size() && i < 16; ++i) {
+        snprintf(t, sizeof(t), "%s%s=%.0f", out.empty() ? "" : ";", v[i].first.c_str(), v[i].second);
+        out += t;
+    }
+    return out;
 }
 
 // ---- serving StopBath ----
@@ -1506,6 +1567,7 @@ int serve(size_t keep)
         }
         auto t0 = Clock::now();
         Result res;
+        stepTimes();   // (0.4: whatever an earlier request left in ART's table: not this one's)
         try {
             res = runCli(r.args, photos, cancel);
         } catch (std::exception &e) {
@@ -1521,6 +1583,7 @@ int serve(size_t keep)
             res.message = "error";
             photos.clear();
         }
+        res.steps = stepTimes();
         {
             std::lock_guard<std::mutex> lock(m);
             current.clear();
@@ -1585,6 +1648,12 @@ int main(int argc, char **argv)
     setlocale(LC_ALL, "");
 #endif
     setlocale(LC_NUMERIC, "C");
+    // 0.4: ART's own per-step timing on (read before anything is developed; two clock readings a step)
+#ifdef _WIN32
+    _putenv_s("ART_PROFILE", "1");
+#else
+    setenv("ART_PROFILE", "1", 1);
+#endif
 #ifdef _WIN32
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);

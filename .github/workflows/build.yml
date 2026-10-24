@@ -25,12 +25,12 @@ jobs:
 
     steps:
       - name: This repository (the helper)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: repo
 
       - name: ART's source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: artraweditor/ART
           ref: ${{ env.ART_VERSION }}
@@ -74,7 +74,7 @@ jobs:
       # exiv2, LibRaw and CTL are built once and kept between builds (they don't change), saving several minutes.
       - name: Libraries kept from an earlier build
         id: deps
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: C:\msys2\msys64\usr\local
           key: deps-windows-ucrt64-1.0.2-exiv2-0.27.7-libraw-${{ env.LIBRAW_COMMIT }}-ctl-${{ env.CTL_COMMIT }}-v1
@@ -171,7 +171,7 @@ jobs:
           test -f ../serve2.tif && echo "served"
 
       - name: Keep the result (download it from this run's page)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: stopbath-engine-windows-x64
           path: bundle
