@@ -4,7 +4,10 @@
  *  A small program built from ART's own processing engine (ART by Alberto Griggio, a fork of RawTherapee), for
  *  StopBath. StopBath starts it once and sends it the same requests it would give ART-cli; it answers them without
  *  starting again, keeps the last photos loaded and reuses ART's raw steps (preprocessing, demosaicing) when only
- *  later settings changed:
+ *  later settings changed. 0.3: also the photo as it is before ART's colour and tone steps (read out of the raw steps,
+ *  in the working colours, denoised, its spots, dehaze and lens corrections done) is kept for the last photo, so a
+ *  change of exposure, colour or tone - or the second of a film's two pictures - starts from there; and "-R" writes a
+ *  picture as three planes of 32-bit numbers (StopBath's film reads it at once):
  *
  *    stopbath-engine --version
  *    stopbath-engine --serve [--keep <n>]
@@ -85,7 +88,7 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-const char *HelperVersion = "0.2";
+const char *HelperVersion = "0.3";
 
 double ms(Clock::time_point a, Clock::time_point b)
 {
@@ -119,7 +122,9 @@ struct RawKey {
 
     bool same(const RawKey &o) const
     {
-        return valid && o.valid && raw == o.raw && lens == o.lens && coarse == o.coarse && denoise == o.denoise &&
+        // (0.3: ART's own comparison of the lens settings leaves out its vignetting and distortion switches)
+        return valid && o.valid && raw == o.raw && lens == o.lens && lens.useVign == o.lens.useVign && lens.useDist == o.lens.useDist &&
+               coarse == o.coarse && denoise == o.denoise &&
                wbTemp == o.wbTemp && wbGreen == o.wbGreen && wbEqual == o.wbEqual && mul[0] == o.mul[0] &&
                mul[1] == o.mul[1] && mul[2] == o.mul[2] && hrOn == o.hrOn && hrMode == o.hrMode &&
                hrBlur == o.hrBlur && frame == o.frame && border == o.border && wbOn == o.wbOn &&
@@ -176,6 +181,72 @@ struct EarlyKey {
     }
 };
 
+/** 0.3: what the photo before ART's colour and tone steps (the end of the transform: before the crop and stage 1)
+ *  depends on - every setting but those only the later steps read (and the date-and-rank kind), as ART's editor
+ *  starts an exposure change from its kept picture. The same again: a copy of that picture is the start. */
+struct MidKey {
+    bool valid = false;
+    RawKey raw;
+    double wb[6] = {0, 0, 0, 0, 0, 0};
+    int tr = 0;
+    bool fast = false;
+    double scale = 1;
+    procparams::ProcParams p;
+
+    static procparams::ProcParams early(const procparams::ProcParams &all, bool fast)
+    {
+        procparams::ProcParams e = all;
+        const procparams::ProcParams d;
+        // (read only in stage 1, 2 and 3, after the resize, or at the output)
+        e.saturation = d.saturation;
+        e.toneCurve = d.toneCurve;
+        e.labCurve = d.labCurve;
+        e.localContrast = d.localContrast;
+        e.rgbCurves = d.rgbCurves;
+        e.sharpening = d.sharpening;
+        e.prsharpening = d.prsharpening;
+        e.impulseDenoise = d.impulseDenoise;
+        e.defringe = d.defringe;
+        e.textureBoost = d.textureBoost;
+        e.logenc = d.logenc;
+        e.toneEqualizer = d.toneEqualizer;
+        e.chmixer = d.chmixer;
+        e.blackwhite = d.blackwhite;
+        e.hsl = d.hsl;
+        e.filmSimulation = d.filmSimulation;
+        e.softlight = d.softlight;
+        e.grain = d.grain;
+        e.smoothing = d.smoothing;
+        e.colorcorrection = d.colorcorrection;
+        e.metadata = d.metadata;
+        e.gradient = d.gradient;       // (the transform leaves the creative ones to stage 3)
+        e.pcvignette = d.pcvignette;
+        e.crop = d.crop;               // (cut out after the kept picture)
+        e.rank = d.rank;
+        e.colorlabel = d.colorlabel;
+        e.inTrash = d.inTrash;
+        e.appVersion = d.appVersion;
+        e.ppVersion = d.ppVersion;
+        // (the exposure's highlight reconstruction is read early; its amount and black in stage 1 - but noise reduction
+        // works on the photo brightened by a positive amount, as ART's editor redoes it after an exposure change)
+        e.exposure.expcomp = all.denoise.enabled && all.exposure.enabled && all.exposure.expcomp > 0 ? all.exposure.expcomp : d.exposure.expcomp;
+        e.exposure.black = d.exposure.black;
+        e.icm.outputProfile = d.icm.outputProfile;
+        e.icm.outputIntent = d.icm.outputIntent;
+        e.icm.outputBPC = d.icm.outputBPC;
+        if (!fast) {
+            e.resize = d.resize;   // (the quick route resizes early: then it counts)
+        }
+        return e;
+    }
+
+    bool same(const MidKey &o) const
+    {
+        return valid && o.valid && raw.same(o.raw) && std::equal(wb, wb + 6, o.wb) && tr == o.tr && fast == o.fast &&
+               scale == o.scale && p == o.p && p.lensProf.useDist == o.p.lensProf.useDist && p.lensProf.useVign == o.p.lensProf.useVign;
+    }
+};
+
 /** What one photo keeps between requests. */
 struct Kept {
     RawKey raw;
@@ -183,11 +254,24 @@ struct Kept {
     std::unique_ptr<Imagefloat> earlyImg;
     ImProcFunctions::DenoiseInfoStore dn;   // (the noise measured for automatic chroma noise reduction)
     DnKey dnKey;
+    /** 0.3: the photo before ART's colour and tone steps, kept: one per size of picture asked for (the loupe's,
+     *  the quick stand-in's, the meter's...), at most three, the least used going. */
+    struct Mid {
+        MidKey key;
+        std::unique_ptr<Imagefloat> img;
+        int fw = 0, fh = 0;
+        bool stop = false;
+        unsigned long used = 0;
+    };
+    std::vector<Mid> mids;
+    unsigned long midClock = 0;
+
+    void dropMid() { mids.clear(); }
 };
 
 struct Times {
     double raw = 0, develop = 0;
-    bool rawReused = false, earlyReused = false;
+    bool rawReused = false, earlyReused = false, midReused = false;
 };
 
 enum { STOPPED = -100 };
@@ -224,11 +308,18 @@ private:
     {
         Imagefloat *res = nullptr;
         if (stage_init(fast) && !stopped()) {
-            if (!stopped()) {
-                stage_denoise();
-            }
-            if (!stopped()) {
-                stage_transform();
+            if (midHit) {
+                stage_mid_kept();
+            } else {
+                if (!stopped()) {
+                    stage_denoise();
+                }
+                if (!stopped()) {
+                    stage_transform();
+                }
+                if (!stopped()) {
+                    keep_mid();
+                }
             }
             if (!stopped()) {
                 res = stage_finish(fast);
@@ -362,6 +453,7 @@ private:
         if (key.same(kept.raw)) {
             times.rawReused = true;
         } else {
+            kept.dropMid();
             kept.raw.valid = false;
             kept.early.valid = false;
             kept.earlyImg.reset();
@@ -415,6 +507,10 @@ private:
             }
             dkey.coarse = params.coarse;
             dkey.icm = params.icm;
+            // (0.3: nor the output profile - the picture before the film has none: measured once for both)
+            dkey.icm.outputProfile = procparams::ColorManagementParams().outputProfile;
+            dkey.icm.outputIntent = procparams::ColorManagementParams().outputIntent;
+            dkey.icm.outputBPC = procparams::ColorManagementParams().outputBPC;
             dkey.hrOn = params.exposure.enabled;
             dkey.hrMode = int(params.exposure.hrmode);
             dkey.hrBlur = params.exposure.hrblur;
@@ -426,6 +522,51 @@ private:
             kept.dnKey.valid = false;   // (until it has been measured)
             ipf.denoiseComputeParams(imgsrc, currWB, kept.dn, params.denoise);
             kept.dnKey.valid = kept.dn.valid;
+        }
+
+        // 0.3: the photo before ART's colour and tone steps, kept from last time: the start, when what it depends on is
+        // the same (the settings that only later steps read may differ)
+        midKey = MidKey();
+        midKey.valid = true;
+        midKey.raw = kept.raw;
+        midKey.wb[0] = currWB.getTemp();
+        midKey.wb[1] = currWB.getGreen();
+        midKey.wb[2] = currWB.getEqual();
+        if (currWB.getTemp() > 0) {
+            currWB.getMultipliers(midKey.wb[3], midKey.wb[4], midKey.wb[5]);
+        }
+        midKey.tr = tr;
+        midKey.fast = is_fast;
+        midKey.scale = scale_factor;
+        midKey.p = MidKey::early(params, is_fast);
+        for (auto &m : kept.mids) {
+            if (m.img && midKey.same(m.key)) {
+                midHit = &m;
+                break;
+            }
+        }
+        if (midHit) {
+            midHit->used = ++kept.midClock;
+            img = midHit->img->copy();
+            fw = midHit->fw;
+            fh = midHit->fh;
+            // (what these steps work out for the later ones, from the image source: as below)
+            if (params.toneCurve.histmatching) {
+                if (!params.toneCurve.fromHistMatching) {
+                    imgsrc->getAutoMatchedToneCurve(params.icm, params.toneCurve.curve, params.toneCurve.curve2);
+                }
+            }
+            if (params.logenc.enabled && params.logenc.autocompute) {
+                ipf.getAutoLog(imgsrc, params.logenc);
+            }
+            if (params.sharpening.enabled && params.sharpening.deconvAutoRadius) {
+                float r = 0.f;
+                if (imgsrc->getDeconvAutoRadius(&r)) {
+                    params.sharpening.deconvradius = r;
+                }
+            }
+            times.midReused = true;
+            return true;
         }
 
         // the small picture ART starts from on the quick route: reused while what it depends on is the same
@@ -567,6 +708,47 @@ private:
                 img = trImg;
             }
         }
+    }
+
+    /** 0.3: the kept picture is where the transform ended: what the steps before it left for the later ones. */
+    void stage_mid_kept()
+    {
+        procparams::ProcParams &params = job.pparams;
+        ImProcFunctions &ipf = *(ipf_p.get());
+        LUTu hist16(65536);
+        ipf.firstAnalysis(img, params, hist16);
+        stop = midHit->stop;
+        (void)params;   // (the automatic distortion is only read by the transform: not worked out again)
+    }
+
+    /** 0.3: the picture where the transform ended, kept for the next request on this photo. */
+    void keep_mid()
+    {
+        auto &ms = kept.mids;
+        for (size_t i = 0; i < ms.size(); ++i) {
+            if (ms[i].key.fast == midKey.fast && ms[i].key.scale == midKey.scale) {   // (the same size: replaced)
+                ms.erase(ms.begin() + i);
+                break;
+            }
+        }
+        while (ms.size() >= 3) {
+            size_t oldest = 0;
+            for (size_t i = 1; i < ms.size(); ++i) {
+                if (ms[i].used < ms[oldest].used) {
+                    oldest = i;
+                }
+            }
+            ms.erase(ms.begin() + oldest);
+        }
+        Kept::Mid m;
+        img->syncCpu();   // (kept in the computer's memory: copied there, not on the graphics card)
+        m.img.reset(img->copy());
+        m.fw = fw;
+        m.fh = fh;
+        m.stop = stop;
+        m.key = midKey;
+        m.used = ++kept.midClock;
+        ms.push_back(std::move(m));
     }
 
     Imagefloat *stage_finish(bool is_fast)
@@ -741,6 +923,8 @@ private:
     ColorTemp currWB;
     Imagefloat *img = nullptr;
     bool stop = false;
+    MidKey midKey;
+    Kept::Mid *midHit = nullptr;
 };
 
 } // namespace sb
@@ -845,6 +1029,16 @@ public:
         return kept_.back().get();
     }
 
+    /** 0.3: the middle picture kept for this photo only (it is the size of the photo: one at a time). */
+    void keepMidOnly(KeptPhoto *photo)
+    {
+        for (auto &k : kept_) {
+            if (k.get() != photo) {
+                k->kept.dropMid();
+            }
+        }
+    }
+
     /** Every photo let go (after an error part way: what was kept may be half changed). */
     void clear()
     {
@@ -863,8 +1057,45 @@ struct Result {
     int code = 0;
     std::string message;
     double load = 0, raw = 0, develop = 0, save = 0;
-    bool photoReused = false, rawReused = false, earlyReused = false;
+    bool photoReused = false, rawReused = false, earlyReused = false, midReused = false;
 };
+
+/** 0.3: a picture as three planes of 32-bit numbers (red, then green, then blue; each row after row), after a header:
+ *  "SBRF", width, height, 3 (32-bit, little-endian). The values as ART's 32-bit TIFF has them. */
+int saveRawPlanes(art::engine::Imagefloat *img, const Glib::ustring &fname)
+{
+    img->syncCpu();
+    const int w = img->getWidth(), h = img->getHeight();
+    std::vector<char> buf;
+    std::vector<float> row;
+    try {
+        buf.resize(1 << 22);
+        row.resize(w);
+    } catch (std::bad_alloc &) {
+        return 1;
+    }
+    FILE *f = g_fopen(fname.c_str(), "wb");
+    if (!f) {
+        return 1;
+    }
+    setvbuf(f, buf.data(), _IOFBF, buf.size());
+    const int32_t head[4] = {0x46524253, w, h, 3};   // ("SBRF")
+    bool ok = fwrite(head, sizeof(head), 1, f) == 1;
+    for (int c = 0; c < 3 && ok; ++c) {
+        for (int y = 0; y < h && ok; ++y) {
+            for (int x = 0; x < w; ++x) {
+                const float v = c == 0 ? img->r(y, x) : c == 1 ? img->g(y, x) : img->b(y, x);
+                row[x] = (std::isnan(v) ? 0.f : v) / 65535.f;   // (as Imagefloat::getScanline for a float file)
+            }
+            ok = fwrite(row.data(), sizeof(float), w, f) == (size_t)w;
+        }
+    }
+    ok = (fclose(f) == 0) && ok;
+    if (!ok) {
+        g_remove(fname.c_str());
+    }
+    return ok ? 0 : 1;
+}
 
 const int Unsupported = 99;
 const int Stopped = 98;
@@ -966,6 +1197,11 @@ Result runCli(const std::vector<Glib::ustring> &args, Photos &photos, const std:
             outputType = "png";
             compression = -1;
             break;
+        case 'R':   // 0.3: StopBath's own: three planes of 32-bit numbers, to the file named as it is
+            outputType = "sbraw";
+            bits = 32;
+            isFloat = true;
+            break;
         case 'f':
             fast = true;
             break;
@@ -1010,7 +1246,12 @@ Result runCli(const std::vector<Glib::ustring> &args, Photos &photos, const std:
     }
 
     Glib::ustring outputFile;
-    if (outputPath.empty()) {
+    if (outputType == "sbraw") {
+        if (outputPath.empty()) {
+            return fail(Unsupported, "-R without -o");
+        }
+        outputFile = outputPath;
+    } else if (outputPath.empty()) {
         outputFile = inputFile.substr(0, inputFile.find_last_of('.')) + "." + oext;
     } else {
         outputFile = outputPath.substr(0, outputPath.find_last_of('.')) + "." + oext;
@@ -1094,6 +1335,7 @@ Result runCli(const std::vector<Glib::ustring> &args, Photos &photos, const std:
 
     art::engine::sb::Times times;
     art::engine::Imagefloat *resultImage = nullptr;
+    photos.keepMidOnly(photo);   // (0.3: before this one is developed: at most this photo's in memory)
     {
         art::engine::sb::Processor proc(*job, photo->kept, cancel, times, errorCode);
         resultImage = proc();
@@ -1103,6 +1345,7 @@ Result runCli(const std::vector<Glib::ustring> &args, Photos &photos, const std:
     res.develop = times.develop;
     res.rawReused = times.rawReused;
     res.earlyReused = times.earlyReused;
+    res.midReused = times.midReused;
     if (!resultImage) {
         if (errorCode == art::engine::sb::STOPPED) {
             return fail(Stopped, "stopped");
@@ -1111,7 +1354,9 @@ Result runCli(const std::vector<Glib::ustring> &args, Photos &photos, const std:
     }
 
     auto s0 = Clock::now();
-    if (outputType == "jpg") {
+    if (outputType == "sbraw") {
+        errorCode = saveRawPlanes(resultImage, outputFile);
+    } else if (outputType == "jpg") {
         errorCode = resultImage->saveAsJPEG(outputFile, compression, subsampling);
     } else if (outputType == "tif") {
         errorCode = resultImage->saveAsTIFF(outputFile, bits, isFloat, compression == 0);
@@ -1160,6 +1405,7 @@ std::string reusedText(const Result &r)
     std::string s = r.photoReused ? "photo:kept" : "photo:loaded";
     s += r.rawReused ? ",raw:reused" : ",raw:made";
     s += r.earlyReused ? ",small:reused" : "";
+    s += r.midReused ? ",mid:reused" : "";
     char t[160];
     snprintf(t, sizeof(t), ",load:%.0f,raw:%.0f,develop:%.0f,save:%.0f", r.load, r.raw, r.develop, r.save);
     return s + t;

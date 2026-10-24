@@ -3,7 +3,13 @@
 A small program built from ART's own processing engine (ART by Alberto Griggio, itself a fork of RawTherapee), for
 the StopBath photo app. StopBath starts it and talks to it; it develops photos the way ART does.
 
-**Version 0.2 (step 2, now):** StopBath starts the helper once and sends it the same requests it would give ART-cli
+**Version 0.3 (now):** as 0.2, and it also keeps the photo as it is before ART's colour and tone steps (read out of
+the raw steps, in the working colours, denoised, its spots, dehaze and lens corrections done) for the last photo: a
+change of exposure, colour or tone, or the second of a film's two pictures, starts from there - as ART's own editor
+does. `-R` writes a picture as three planes of 32-bit numbers ("SBRF", width, height, 3, then red, green and blue),
+the values of ART's 32-bit TIFF, which StopBath's film reads at once. Pictures are still ART-cli's, pixel for pixel.
+
+**Version 0.2:** StopBath starts the helper once and sends it the same requests it would give ART-cli
 (the same settings files, the same pictures out). The helper answers them without starting ART again, keeps the last
 photos loaded, and reuses ART's first steps (decoding, demosaicing, the small picture ART starts from, the noise
 measured for automatic noise reduction) while only later settings change, so a change shows sooner. Its pictures
@@ -16,7 +22,7 @@ are ART-cli's, pixel for pixel. Anything it doesn't do is left to ART-cli.
 `--serve` reads requests one at a time:
 
     run <id> <count>      then <count> lines, ART-cli's arguments one per line (-o/-O, -p, -d, -Y, -f, -j, -js, -t,
-                          -b, -n, -c <one photo>)
+                          -b, -n, -R, -c <one photo>)
     cancel <id>           stop it at its next step
     quit
 
