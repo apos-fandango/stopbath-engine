@@ -8,7 +8,8 @@
  *  in the working colours, denoised, its spots, dehaze and lens corrections done) is kept for the last photo, so a
  *  change of exposure, colour or tone - or the second of a film's two pictures - starts from there; and "-R" writes a
  *  picture as three planes of 32-bit numbers (StopBath's film reads it at once). 0.4: each answer also says how long
- *  ART's steps took (ART's own per-step timing):
+ *  ART's steps took (ART's own per-step timing). 0.5: "-Q" writes a quick 8-bit TIFF (ART-cli's pixels, its colour
+ *  profile, no metadata: ART's saving rewrites the whole file to add that):
  *
  *    stopbath-engine --version
  *    stopbath-engine --serve [--keep <n>]
@@ -95,7 +96,7 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-const char *HelperVersion = "0.4";
+const char *HelperVersion = "0.5";
 
 double ms(Clock::time_point a, Clock::time_point b)
 {
@@ -554,7 +555,7 @@ private:
         }
         if (midHit) {
             midHit->used = ++kept.midClock;
-            { ART_PROFILE_SCOPE("sb.keptCopy"); img = midHit->img->copy(); }
+            // (0.5: copied in stage_mid_kept - only the crop's part of it, when cropped)
             fw = midHit->fw;
             fh = midHit->fh;
             // (what these steps work out for the later ones, from the image source: as below)
@@ -727,10 +728,41 @@ private:
     {
         procparams::ProcParams &params = job.pparams;
         ImProcFunctions &ipf = *(ipf_p.get());
+        const Imagefloat *mid = midHit->img.get();
         LUTu hist16(65536);
-        { ART_PROFILE_SCOPE("sb.firstAnalysis"); ipf.firstAnalysis(img, params, hist16); }
+        { ART_PROFILE_SCOPE("sb.firstAnalysis"); ipf.firstAnalysis(mid, params, hist16); }   // (the whole picture's, as before)
         stop = midHit->stop;
-        (void)params;   // (the automatic distortion is only read by the transform: not worked out again)
+        // (the automatic distortion is only read by the transform: not worked out again)
+        ART_PROFILE_SCOPE("sb.keptCopy");
+        // 0.5: cropped - the crop is the first of the later steps: only its part of the kept picture is copied (the same
+        // pixels as copying it all and cropping; stage_finish then only tells the steps where the part sits)
+        if (params.crop.enabled) {
+            const int iw = mid->getWidth(), ih = mid->getHeight();
+            const int cx = params.crop.x * scale_factor + 0.5;
+            const int cy = params.crop.y * scale_factor + 0.5;
+            const int cw = std::min(int(params.crop.w * scale_factor + 0.5), iw - cx);
+            const int ch = std::min(int(params.crop.h * scale_factor + 0.5), ih - cy);
+            if (cx >= 0 && cy >= 0 && cw > 0 && ch > 0) {
+                img = new Imagefloat(cw, ch, mid);
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+                for (int row = 0; row < ch; row++) {
+                    for (int col = 0; col < cw; col++) {
+                        img->r(row, col) = mid->r(row + cy, col + cx);
+                        img->g(row, col) = mid->g(row + cy, col + cx);
+                        img->b(row, col) = mid->b(row + cy, col + cx);
+                    }
+                }
+                preCropped = true;
+                preCropX = cx;
+                preCropY = cy;
+                preCropW = iw;
+                preCropH = ih;
+                return;
+            }
+        }
+        img = mid->copy();
     }
 
     /** 0.3: the picture where the transform ended, kept for the next request on this photo. */
@@ -769,7 +801,9 @@ private:
         ImProcFunctions &ipf = *(ipf_p.get());
 
         int cx = 0, cy = 0, cw = img->getWidth(), ch = img->getHeight();
-        if (params.crop.enabled) {
+        if (preCropped) {
+            ipf.setViewport(preCropX, preCropY, preCropW, preCropH);   // 0.5: cropped already (stage_mid_kept)
+        } else if (params.crop.enabled) {
             ART_PROFILE_SCOPE("sb.crop");
             int iw = img->getWidth();
             int ih = img->getHeight();
@@ -937,6 +971,8 @@ private:
     PreviewProps pp = PreviewProps(0, 0, 0, 0, 0);
     ColorTemp currWB;
     Imagefloat *img = nullptr;
+    bool preCropped = false;   // 0.5: the kept picture's crop taken already (where it sat, in what size of picture)
+    int preCropX = 0, preCropY = 0, preCropW = 0, preCropH = 0;
     bool stop = false;
     MidKey midKey;
     Kept::Mid *midHit = nullptr;
@@ -1113,6 +1149,104 @@ int saveRawPlanes(art::engine::Imagefloat *img, const Glib::ustring &fname)
     return ok ? 0 : 1;
 }
 
+/** 0.5: the colour profile ART set on its picture for the output (ART keeps it to itself). */
+struct ProfileOf: art::engine::ImageIO {
+    static std::pair<const char *, int> get(const art::engine::ImageIO *i)
+    {
+        return {i->*(&ProfileOf::profileData), i->*(&ProfileOf::profileLength)};
+    }
+};
+
+/** 0.5: StopBath's quick picture ("-Q"): an uncompressed 8-bit TIFF (little-endian, one strip, R G B, the output's
+ *  colour profile, no other metadata), the pixels as ART-cli's 8-bit TIFF has them (as Imagefloat::getScanline makes
+ *  them). ART's own saving writes the file, then reads and writes it all again to add the photo's metadata - a
+ *  quarter of a second on a full-size picture; StopBath shows the picture and needs none of it. */
+int saveQuickTiff(art::engine::Imagefloat *img, const Glib::ustring &fname)
+{
+    img->syncCpu();
+    const int w = img->getWidth(), h = img->getHeight();
+    const auto prof = ProfileOf::get(img);
+    const uint32_t iccLen = prof.first && prof.second > 0 ? (uint32_t)prof.second : 0;
+    const uint64_t bytes = (uint64_t)w * h * 3;
+    if (w <= 0 || h <= 0 || bytes > 0xFFFFFFF0ull - 4096 - iccLen) {
+        return 1;
+    }
+    std::vector<unsigned char> px;
+    try {
+        px.resize(bytes);
+    } catch (std::bad_alloc &) {
+        return 1;
+    }
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+    for (int y = 0; y < h; ++y) {
+        unsigned char *o = px.data() + (size_t)y * w * 3;
+        for (int x = 0; x < w; ++x) {
+            *o++ = art::engine::uint16ToUint8Rounded(art::engine::CLIP(img->r(y, x)));
+            *o++ = art::engine::uint16ToUint8Rounded(art::engine::CLIP(img->g(y, x)));
+            *o++ = art::engine::uint16ToUint8Rounded(art::engine::CLIP(img->b(y, x)));
+        }
+    }
+    // the header: the directory, the bits per sample, the profile, then the pixels
+    const uint16_t entries = iccLen ? 12 : 11;
+    const uint32_t ifdAt = 8, bitsAt = ifdAt + 2 + entries * 12 + 4, iccAt = bitsAt + 6;
+    const uint32_t dataAt = iccAt + ((iccLen + 1) / 2) * 2;
+    std::vector<unsigned char> head;
+    auto u16 = [&](uint16_t v) { head.push_back(v & 0xff); head.push_back(v >> 8); };
+    auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) head.push_back((v >> (8 * i)) & 0xff); };
+    auto entry = [&](uint16_t tag, uint16_t type, uint32_t count, uint32_t value) {
+        u16(tag);
+        u16(type);
+        u32(count);
+        if (type == 3 && count == 1) {   // (a SHORT value sits in the first two bytes)
+            u16((uint16_t)value);
+            u16(0);
+        } else {
+            u32(value);
+        }
+    };
+    head.push_back('I');
+    head.push_back('I');
+    u16(42);
+    u32(ifdAt);
+    u16(entries);
+    entry(256, 4, 1, w);
+    entry(257, 4, 1, h);
+    entry(258, 3, 3, bitsAt);
+    entry(259, 3, 1, 1);   // no compression
+    entry(262, 3, 1, 2);   // RGB
+    entry(273, 4, 1, dataAt);
+    entry(274, 3, 1, 1);   // top left
+    entry(277, 3, 1, 3);
+    entry(278, 4, 1, h);
+    entry(279, 4, 1, (uint32_t)bytes);
+    entry(339, 3, 1, 1);   // unsigned integers
+    if (iccLen) {
+        entry(34675, 7, iccLen, iccAt);
+    }
+    u32(0);
+    u16(8);
+    u16(8);
+    u16(8);
+    if (iccLen) {
+        head.insert(head.end(), prof.first, prof.first + iccLen);
+        if (iccLen % 2) {
+            head.push_back(0);
+        }
+    }
+    FILE *f = g_fopen(fname.c_str(), "wb");
+    if (!f) {
+        return 1;
+    }
+    bool ok = fwrite(head.data(), 1, head.size(), f) == head.size() && fwrite(px.data(), 1, px.size(), f) == px.size();
+    ok = (fclose(f) == 0) && ok;
+    if (!ok) {
+        g_remove(fname.c_str());
+    }
+    return ok ? 0 : 1;
+}
+
 const int Unsupported = 99;
 const int Stopped = 98;
 
@@ -1218,6 +1352,11 @@ Result runCli(const std::vector<Glib::ustring> &args, Photos &photos, const std:
             bits = 32;
             isFloat = true;
             break;
+        case 'Q':   // 0.5: StopBath's own: a quick 8-bit TIFF (no metadata), to the file named as it is
+            outputType = "sbtif";
+            bits = 8;
+            isFloat = false;
+            break;
         case 'f':
             fast = true;
             break;
@@ -1262,9 +1401,9 @@ Result runCli(const std::vector<Glib::ustring> &args, Photos &photos, const std:
     }
 
     Glib::ustring outputFile;
-    if (outputType == "sbraw") {
+    if (outputType == "sbraw" || outputType == "sbtif") {
         if (outputPath.empty()) {
-            return fail(Unsupported, "-R without -o");
+            return fail(Unsupported, "-R / -Q without -o");
         }
         outputFile = outputPath;
     } else if (outputPath.empty()) {
@@ -1372,6 +1511,8 @@ Result runCli(const std::vector<Glib::ustring> &args, Photos &photos, const std:
     auto s0 = Clock::now();
     if (outputType == "sbraw") {
         errorCode = saveRawPlanes(resultImage, outputFile);
+    } else if (outputType == "sbtif") {
+        errorCode = saveQuickTiff(resultImage, outputFile);
     } else if (outputType == "jpg") {
         errorCode = resultImage->saveAsJPEG(outputFile, compression, subsampling);
     } else if (outputType == "tif") {

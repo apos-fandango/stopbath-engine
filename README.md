@@ -3,7 +3,12 @@
 A small program built from ART's own processing engine (ART by Alberto Griggio, itself a fork of RawTherapee), for
 the StopBath photo app. StopBath starts it and talks to it; it develops photos the way ART does.
 
-**Version 0.4 (now):** as 0.3, and each answer also says how long ART's steps took: ART's own per-step timing
+**Version 0.5 (now):** as 0.4, and `-Q` writes StopBath's quick picture: an uncompressed 8-bit TIFF with the
+output's colour profile and no other metadata (ART's own saving writes the file, then reads and writes it all again
+to add the metadata), the pixels as ART-cli's 8-bit TIFF. A picture made from the kept earlier steps with a crop
+copies only the crop's part of them (the same pixels). Pictures are still ART-cli's, pixel for pixel.
+
+**Version 0.4:** as 0.3, and each answer also says how long ART's steps took: ART's own per-step timing
 (`ART_PROFILE`, switched on by the helper; two clock readings a step), with the helper's own steps (reading the
 picture out, noise reduction, the lens corrections, the output colours...) named `sb.*`. The answer's `<what was
 reused>` ends with `,steps:<name>=<ms>;<name>=<ms>...`, slowest first. The build uses the GitHub actions' newer
@@ -28,7 +33,7 @@ are ART-cli's, pixel for pixel. Anything it doesn't do is left to ART-cli.
 `--serve` reads requests one at a time:
 
     run <id> <count>      then <count> lines, ART-cli's arguments one per line (-o/-O, -p, -d, -Y, -f, -j, -js, -t,
-                          -b, -n, -R, -c <one photo>)
+                          -b, -n, -R, -Q, -c <one photo>)
     cancel <id>           stop it at its next step
     quit
 
