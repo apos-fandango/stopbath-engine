@@ -9,13 +9,16 @@
  *  change of exposure, colour or tone - or the second of a film's two pictures - starts from there; and "-R" writes a
  *  picture as three planes of 32-bit numbers (StopBath's film reads it at once). 0.4: each answer also says how long
  *  ART's steps took (ART's own per-step timing). 0.5: "-Q" writes a quick 8-bit TIFF (ART-cli's pixels, its colour
- *  profile, no metadata: ART's saving rewrites the whole file to add that):
+ *  profile, no metadata: ART's saving rewrites the whole file to add that). 0.6: the picture after ART's stage 1 (exposure,
+ *  channel mixer, HSL, tone equalizer) and after stage 2 (sharpening, colour correction, smoothing...) is kept too, as
+ *  ART's editor does: a change in a later stage starts there; "-N" (a picture made ahead) keeps nothing, so it doesn't
+ *  push out the photo being edited:
  *
  *    stopbath-engine --version
  *    stopbath-engine --serve [--keep <n>]
  *        requests on standard input, one at a time:
  *          run <id> <count>        then <count> lines: ART-cli's arguments (-o/-O, -p, -d, -Y, -f, -j, -js, -t, -b,
- *                                  -n, -c <one photo>), one per line
+ *                                  -n, -c <one photo>), one per line; StopBath's own: -R, -Q, -N
  *          cancel <id>             stop that request at the next step
  *          quit
  *        answers on standard output (other lines there are ART's own and can be ignored):
@@ -96,7 +99,7 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-const char *HelperVersion = "0.5";
+const char *HelperVersion = "0.6";
 
 double ms(Clock::time_point a, Clock::time_point b)
 {
@@ -255,6 +258,60 @@ struct MidKey {
     }
 };
 
+/** 0.6: what the picture after ART's stage 1 or 2 depends on: the kept middle picture's (MidKey), the crop, and every
+ *  setting but those only the later stages (and the output) read. */
+struct LateKey {
+    bool valid = false;
+    MidKey mid;
+    procparams::ProcParams p;
+
+    static procparams::ProcParams upTo(const procparams::ProcParams &all, int stage)
+    {
+        procparams::ProcParams e = all;
+        const procparams::ProcParams d;
+        if (stage < 2) {   // (stage 2's)
+            e.sharpening = d.sharpening;
+            e.impulseDenoise = d.impulseDenoise;
+            e.defringe = d.defringe;
+            e.colorcorrection = d.colorcorrection;
+            e.smoothing = d.smoothing;
+            e.prsharpening = d.prsharpening;   // (ART's sharpening step reads it too: kept in stage 2's key)
+        }
+        // (stage 3's)
+        e.gradient = d.gradient;
+        e.pcvignette = d.pcvignette;
+        e.textureBoost = d.textureBoost;
+        e.grain = d.grain;
+        e.logenc = d.logenc;
+        e.saturation = d.saturation;
+        e.filmSimulation = d.filmSimulation;
+        e.toneCurve = d.toneCurve;
+        e.rgbCurves = d.rgbCurves;
+        e.labCurve = d.labCurve;
+        e.softlight = d.softlight;
+        e.localContrast = d.localContrast;
+        e.blackwhite = d.blackwhite;
+        // (the output's)
+        e.resize = d.resize;   // (the quick route's scale is in the middle picture's key)
+        e.icm.outputProfile = d.icm.outputProfile;
+        e.icm.outputIntent = d.icm.outputIntent;
+        e.icm.outputBPC = d.icm.outputBPC;
+        e.metadata = d.metadata;
+        e.rank = d.rank;
+        e.colorlabel = d.colorlabel;
+        e.inTrash = d.inTrash;
+        e.appVersion = d.appVersion;
+        e.ppVersion = d.ppVersion;
+        return e;
+    }
+
+    bool same(const LateKey &o) const
+    {
+        return valid && o.valid && mid.same(o.mid) && p == o.p && p.lensProf.useDist == o.p.lensProf.useDist &&
+               p.lensProf.useVign == o.p.lensProf.useVign;
+    }
+};
+
 /** What one photo keeps between requests. */
 struct Kept {
     RawKey raw;
@@ -273,21 +330,41 @@ struct Kept {
     };
     std::vector<Mid> mids;
     unsigned long midClock = 0;
+    /** 0.6: the picture after ART's stage 1 and after stage 2, kept: one pair per size and crop of picture (the loupe's,
+     *  a part's, the quick stand-in's), at most three, the least used going. Stage 2's only when no mask of a later step
+     *  is linked to one of its masks (those are passed from step to step while developing). */
+    struct Late {
+        LateKey key1, key2;
+        std::unique_ptr<Imagefloat> img1, img2;
+        bool stop1 = false, stop2 = false;
+        bool viewport = false;
+        int vx = 0, vy = 0, vw = 0, vh = 0;
+        unsigned long used = 0;
+    };
+    std::vector<Late> lates;
 
-    void dropMid() { mids.clear(); }
+    void dropMid()
+    {
+        mids.clear();
+        lates.clear();
+    }
 };
 
 struct Times {
     double raw = 0, develop = 0;
     bool rawReused = false, earlyReused = false, midReused = false;
+    int lateReused = 0;   // 0.6: after ART's stage 1 or 2 (0: neither)
 };
 
 enum { STOPPED = -100 };
 
 class Processor {
 public:
-    Processor(ProcessingJobImpl &job, Kept &kept, const std::atomic<bool> &cancel, Times &times, int &errorCode)
-        : job(job), kept(kept), cancel(cancel), times(times), errorCode(errorCode)
+    /** @param keep 0.6: false - a picture made ahead of a photo kept: what it makes isn't kept (the photo's kept pictures
+     *  stay). @param keepLate false: the pictures after stage 1 and 2 aren't kept (a photo made ahead: its middle one is). */
+    Processor(ProcessingJobImpl &job, Kept &kept, const std::atomic<bool> &cancel, Times &times, int &errorCode, bool keep = true,
+              bool keepLate = true)
+        : job(job), kept(kept), cancel(cancel), times(times), errorCode(errorCode), keep(keep), keepLate(keep && keepLate)
     {
     }
 
@@ -316,8 +393,11 @@ private:
     {
         Imagefloat *res = nullptr;
         if (stage_init(fast) && !stopped()) {
+            late_keys();   // 0.6 (the settings as the steps before the transform leave them)
             if (midHit) {
-                stage_mid_kept();
+                if (!find_late()) {
+                    stage_mid_kept();
+                }
             } else {
                 if (!stopped()) {
                     stage_denoise();
@@ -325,7 +405,7 @@ private:
                 if (!stopped()) {
                     stage_transform();
                 }
-                if (!stopped()) {
+                if (!stopped() && keep) {
                     keep_mid();
                 }
             }
@@ -644,12 +724,14 @@ private:
             if (stopped()) {
                 return false;
             }
-            kept.early.valid = false;
             { ART_PROFILE_SCOPE("sb.earlyResize"); stage_early_resize(); }
-            kept.early = ekey;
-            kept.early.outW = fw;
-            kept.early.outH = fh;
-            kept.earlyImg.reset(img->copy());
+            if (keep) {
+                kept.early.valid = false;
+                kept.early = ekey;
+                kept.early.outW = fw;
+                kept.early.outH = fh;
+                kept.earlyImg.reset(img->copy());
+            }
         }
 
         return true;
@@ -775,6 +857,13 @@ private:
                 break;
             }
         }
+        // (0.6: the later pictures of that size came from the one replaced: gone too)
+        auto &ls = kept.lates;
+        ls.erase(std::remove_if(ls.begin(), ls.end(), [&](const Kept::Late &l) {
+                     const LateKey &k = l.key1.valid ? l.key1 : l.key2;
+                     return k.mid.fast == midKey.fast && k.mid.scale == midKey.scale;
+                 }),
+                 ls.end());
         while (ms.size() >= 3) {
             size_t oldest = 0;
             for (size_t i = 1; i < ms.size(); ++i) {
@@ -795,14 +884,134 @@ private:
         ms.push_back(std::move(m));
     }
 
+    /** 0.6: whether a mask of a later step takes one of an earlier step's (ART passes those along while developing: the
+     *  picture after stage 2 can't be the start then). */
+    static bool linkedMasks(const procparams::ProcParams &params)
+    {
+        for (auto p : params.get_maskable()) {
+            for (auto &m : p->get_masks()) {
+                if (m.enabled && m.linkedMask.enabled && !m.linkedMask.toolname.empty() && !m.linkedMask.name.empty()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** 0.6: the keys of the pictures after stage 1 and 2 for this request (the crop is in the settings). */
+    void late_keys()
+    {
+        const procparams::ProcParams &params = job.pparams;
+        lateKey1 = LateKey();
+        lateKey1.valid = true;
+        lateKey1.mid = midKey;
+        lateKey1.p = LateKey::upTo(params, 1);
+        lateKey2 = LateKey();
+        lateKey2.valid = !linkedMasks(params);
+        lateKey2.mid = midKey;
+        lateKey2.p = LateKey::upTo(params, 2);
+    }
+
+    /** 0.6: the picture after stage 2 (else 1) kept from an earlier request, when what it depends on is the same: the
+     *  start (true). The kept middle picture is then not copied. */
+    bool find_late()
+    {
+        for (auto &l : kept.lates) {
+            if (l.img2 && lateKey2.same(l.key2)) {
+                lateHit = &l;
+                lateLevel = 2;
+                break;
+            }
+        }
+        if (!lateHit) {
+            for (auto &l : kept.lates) {
+                if (l.img1 && lateKey1.same(l.key1)) {
+                    lateHit = &l;
+                    lateLevel = 1;
+                    break;
+                }
+            }
+        }
+        if (!lateHit) {
+            return false;
+        }
+        lateHit->used = ++kept.midClock;
+        times.lateReused = lateLevel;
+        return true;
+    }
+
+    /** 0.6: this request's slot among the kept later pictures: one per size of picture (the loupe's, the quick
+     *  stand-in's, full size - its parts share one: moving the photo replaces it), past three the least used going. */
+    Kept::Late &late_slot()
+    {
+        auto &ls = kept.lates;
+        for (auto &l : ls) {
+            const LateKey &k = l.key1.valid ? l.key1 : l.key2;
+            if (k.mid.fast == midKey.fast && k.mid.scale == midKey.scale) {
+                return l;
+            }
+        }
+        while (ls.size() >= 3) {
+            size_t oldest = 0;
+            for (size_t i = 1; i < ls.size(); ++i) {
+                if (ls[i].used < ls[oldest].used) {
+                    oldest = i;
+                }
+            }
+            ls.erase(ls.begin() + oldest);
+        }
+        ls.emplace_back();
+        return ls.back();
+    }
+
+    void keep_late(int level, bool viewport, int vx, int vy, int vw, int vh)
+    {
+        // (0.6: not for a big picture - a whole photo at full size: two more copies of it would be a lot of memory)
+        if (!keepLate || (long long)img->getWidth() * img->getHeight() > LateMaxPixels) {
+            return;
+        }
+        Kept::Late &l = late_slot();
+        l.viewport = viewport;
+        l.vx = vx;
+        l.vy = vy;
+        l.vw = vw;
+        l.vh = vh;
+        l.used = ++kept.midClock;
+        img->syncCpu();   // (kept in the computer's memory)
+        ART_PROFILE_SCOPE("sb.keepLate");
+        if (level == 1) {
+            l.key1 = lateKey1;
+            l.img1.reset(img->copy());
+            l.stop1 = stop;
+            l.key2.valid = false;   // (a stage 2 picture of other settings before it: gone - made again below)
+            l.img2.reset();
+        } else {
+            l.key2 = lateKey2;
+            l.img2.reset(img->copy());
+            l.stop2 = stop;
+        }
+    }
+
     Imagefloat *stage_finish(bool is_fast)
     {
         procparams::ProcParams &params = job.pparams;
         ImProcFunctions &ipf = *(ipf_p.get());
 
+        // 0.6: from the picture after stage 2 or 1, kept
+        if (lateHit) {
+            return stage_finish_late(is_fast);
+        }
+
         int cx = 0, cy = 0, cw = img->getWidth(), ch = img->getHeight();
+        bool viewport = false;
+        int vx = 0, vy = 0, vw = 0, vh = 0;
         if (preCropped) {
             ipf.setViewport(preCropX, preCropY, preCropW, preCropH);   // 0.5: cropped already (stage_mid_kept)
+            viewport = true;
+            vx = preCropX;
+            vy = preCropY;
+            vw = preCropW;
+            vh = preCropH;
         } else if (params.crop.enabled) {
             ART_PROFILE_SCOPE("sb.crop");
             int iw = img->getWidth();
@@ -814,6 +1023,11 @@ private:
             ch = std::min(int(params.crop.h * scale_factor + 0.5), ih - cy);
 
             ipf.setViewport(cx, cy, iw, ih);
+            viewport = true;
+            vx = cx;
+            vy = cy;
+            vw = iw;
+            vh = ih;
 
             Imagefloat *tmpimg = new Imagefloat(cw, ch, img);
 #ifdef _OPENMP
@@ -839,11 +1053,82 @@ private:
         if (stopped()) {
             return nullptr;
         }
+        // 0.6: kept after stage 1 and after stage 2 - only when that stage did something (else the one before serves)
+        const bool any1 = params.chmixer.enabled || params.exposure.enabled || params.hsl.enabled ||
+                          params.toneEqualizer.enabled || params.icm.workingProfile == "ProPhoto";
+        const bool any2 = params.sharpening.enabled || params.impulseDenoise.enabled || params.defringe.enabled ||
+                          params.colorcorrection.enabled || params.smoothing.enabled || params.icm.dcp_look_early;
+        if (any1 || !any2) {
+            keep_late(1, viewport, vx, vy, vw, vh);
+        }
         stop = stop || ipf.process(ImProcFunctions::Stage::STAGE_2, img);
+        if (stopped()) {
+            return nullptr;
+        }
+        if (any2 && lateKey2.valid) {
+            keep_late(2, viewport, vx, vy, vw, vh);
+        }
         stop = stop || ipf.process(ImProcFunctions::Stage::STAGE_3, img);
         if (stopped()) {
             return nullptr;
         }
+        return stage_output(is_fast);
+    }
+
+    /** 0.6: from a picture kept after stage 1 or 2: the stages after it, then the output. */
+    Imagefloat *stage_finish_late(bool is_fast)
+    {
+        procparams::ProcParams &params = job.pparams;
+        ImProcFunctions &ipf = *(ipf_p.get());
+        {
+            // (what the first analysis leaves for the later steps: the working colours' luminance - from any picture)
+            ART_PROFILE_SCOPE("sb.firstAnalysis");
+            Imagefloat one(1, 1);
+            one.r(0, 0) = one.g(0, 0) = one.b(0, 0) = 0.f;
+            LUTu hist16(65536);
+            ipf.firstAnalysis(&one, params, hist16);
+        }
+        {
+            ART_PROFILE_SCOPE("sb.keptCopy");
+            img = (lateLevel == 2 ? lateHit->img2 : lateHit->img1)->copy();
+        }
+        stop = lateLevel == 2 ? lateHit->stop2 : lateHit->stop1;
+        if (lateHit->viewport) {
+            ipf.setViewport(lateHit->vx, lateHit->vy, lateHit->vw, lateHit->vh);
+        }
+        DCPProfile::ApplyState as;
+        DCPProfile *dcpProf = imgsrc->getDCP(params.icm, as);
+        ipf.setDCPProfile(dcpProf, as);
+        if (lateLevel == 1) {
+            stop = stop || ipf.process(ImProcFunctions::Stage::STAGE_2, img);
+            if (stopped()) {
+                return nullptr;
+            }
+            const bool any2 = params.sharpening.enabled || params.impulseDenoise.enabled || params.defringe.enabled ||
+                              params.colorcorrection.enabled || params.smoothing.enabled || params.icm.dcp_look_early;
+            if (any2 && lateKey2.valid) {
+                Kept::Late *was = lateHit;   // (the slot it came from: the stage 2 picture beside it)
+                if (keepLate) {
+                    img->syncCpu();
+                    ART_PROFILE_SCOPE("sb.keepLate");
+                    was->key2 = lateKey2;
+                    was->img2.reset(img->copy());
+                    was->stop2 = stop;
+                }
+            }
+        }
+        stop = stop || ipf.process(ImProcFunctions::Stage::STAGE_3, img);
+        if (stopped()) {
+            return nullptr;
+        }
+        return stage_output(is_fast);
+    }
+
+    /** The output: resize (not on the quick route), sharpening after it, the output colours, metadata. */
+    Imagefloat *stage_output(bool is_fast)
+    {
+        procparams::ProcParams &params = job.pparams;
+        ImProcFunctions &ipf = *(ipf_p.get());
 
         if (params.resize.enabled) {
             if (!is_fast) {
@@ -976,6 +1261,12 @@ private:
     bool stop = false;
     MidKey midKey;
     Kept::Mid *midHit = nullptr;
+    bool keep = true;
+    bool keepLate = true;
+    LateKey lateKey1, lateKey2;   // 0.6
+    static constexpr long long LateMaxPixels = 12000000;   // (the loupe's, a part's: far less)
+    Kept::Late *lateHit = nullptr;
+    int lateLevel = 0;
 };
 
 } // namespace sb
@@ -1022,13 +1313,13 @@ public:
 
     ~Photos()
     {
-        for (auto &k : kept_) {
-            k->ii->decreaseRef();
-        }
+        clear();
     }
 
     /** The photo, loaded (or kept from before and unchanged on disk); null: it couldn't be loaded. */
-    KeptPhoto *get(const Glib::ustring &path, bool isRaw, bool &reused, int &errorCode)
+    /** @param ahead 0.6: a picture made ahead ("-N"): a photo not kept is loaded into a place of its own (one photo: the
+     *  last made ahead), the photos kept stay as they are; asked for normally later, it moves in among them. */
+    KeptPhoto *get(const Glib::ustring &path, bool isRaw, bool &reused, int &errorCode, bool ahead = false)
     {
         gint64 mtime = -1;
         goffset size = -1;
@@ -1044,7 +1335,9 @@ public:
             auto &k = kept_[i];
             if (k->path == path && k->isRaw == isRaw) {
                 if (mtime >= 0 && k->mtime == mtime && k->size == size) {
-                    k->used = Clock::now();
+                    if (!ahead) {
+                        k->used = Clock::now();   // (0.6: made ahead: not counted as used - it mustn't outlast the photo being edited)
+                    }
                     reused = true;
                     return k.get();
                 }
@@ -1053,11 +1346,50 @@ public:
                 break;
             }
         }
-        reused = false;
+        // 0.6: the photo last made ahead
+        std::unique_ptr<KeptPhoto> fromAhead;
+        if (ahead_ && ahead_->path == path && ahead_->isRaw == isRaw) {
+            if (mtime >= 0 && ahead_->mtime == mtime && ahead_->size == size) {
+                if (ahead) {
+                    reused = true;
+                    return ahead_.get();
+                }
+                fromAhead = std::move(ahead_);   // (asked for now: it moves in among the photos kept)
+            } else {
+                dropAhead();
+            }
+        }
+        if (fromAhead) {
+            reused = true;
+        } else {
+            reused = false;
+        }
         errorCode = 0;
-        auto ii = art::engine::InitialImage::load(path, isRaw, &errorCode, nullptr);
+        art::engine::InitialImage *ii = fromAhead ? fromAhead->ii : nullptr;
+        if (!ii) {
+            ii = art::engine::InitialImage::load(path, isRaw, &errorCode, nullptr);
+        }
         if (!ii) {
             return nullptr;
+        }
+        if (ahead) {
+            dropAhead();
+            ahead_.reset(new KeptPhoto());
+            ahead_->path = path;
+            ahead_->mtime = mtime;
+            ahead_->size = size;
+            ahead_->isRaw = isRaw;
+            ahead_->ii = ii;
+            ahead_->used = Clock::now();
+            return ahead_.get();
+        }
+        if (fromAhead) {
+            while (kept_.size() >= keep_) {
+                dropOldest();
+            }
+            fromAhead->used = Clock::now();
+            kept_.push_back(std::move(fromAhead));
+            return kept_.back().get();
         }
         while (kept_.size() >= keep_) {
             size_t oldest = 0;
@@ -1080,6 +1412,9 @@ public:
         return kept_.back().get();
     }
 
+    /** 0.6: whether it is the photo last made ahead (its own place). */
+    bool isAhead(const KeptPhoto *p) const { return ahead_ && ahead_.get() == p; }
+
     /** 0.3: the middle picture kept for this photo only (it is the size of the photo: one at a time). */
     void keepMidOnly(KeptPhoto *photo)
     {
@@ -1097,11 +1432,33 @@ public:
             k->ii->decreaseRef();
         }
         kept_.clear();
+        dropAhead();
     }
 
 private:
+    void dropAhead()
+    {
+        if (ahead_) {
+            ahead_->ii->decreaseRef();
+            ahead_.reset();
+        }
+    }
+
+    void dropOldest()
+    {
+        size_t oldest = 0;
+        for (size_t i = 1; i < kept_.size(); ++i) {
+            if (kept_[i]->used < kept_[oldest]->used) {
+                oldest = i;
+            }
+        }
+        kept_[oldest]->ii->decreaseRef();
+        kept_.erase(kept_.begin() + oldest);
+    }
+
     size_t keep_;
     std::vector<std::unique_ptr<KeptPhoto>> kept_;
+    std::unique_ptr<KeptPhoto> ahead_;   // 0.6: the photo last made ahead (its own place: the kept ones stay)
 };
 
 struct Result {
@@ -1110,6 +1467,7 @@ struct Result {
     std::string steps;   // 0.4: ART's steps' times (see stepTimes)
     double load = 0, raw = 0, develop = 0, save = 0;
     bool photoReused = false, rawReused = false, earlyReused = false, midReused = false;
+    int lateReused = 0;   // 0.6: the picture after ART's stage 1 or 2
 };
 
 /** 0.3: a picture as three planes of 32-bit numbers (red, then green, then blue; each row after row), after a header:
@@ -1264,7 +1622,7 @@ Result runCli(const std::vector<Glib::ustring> &args, Photos &photos, const std:
     std::vector<Glib::ustring> inputFiles;
     std::vector<PartialProfile> processingParams;
     Glib::ustring outputPath;
-    bool overwriteFiles = false, copyParamsFile = false, useDefault = false, fast = false;
+    bool overwriteFiles = false, copyParamsFile = false, useDefault = false, fast = false, ahead = false;
     int compression = 92, subsampling = 3, bits = -1;
     bool isFloat = false;
     std::string outputType;
@@ -1360,6 +1718,9 @@ Result runCli(const std::vector<Glib::ustring> &args, Photos &photos, const std:
         case 'f':
             fast = true;
             break;
+        case 'N':   // 0.6: StopBath's own: a picture made ahead - nothing kept for it
+            ahead = true;
+            break;
         case 'c':
             for (++i; i < args.size(); ++i) {
                 inputFiles.push_back(args[i]);
@@ -1452,7 +1813,7 @@ Result runCli(const std::vector<Glib::ustring> &args, Photos &photos, const std:
 
     auto t0 = Clock::now();
     int errorCode = 0;
-    KeptPhoto *photo = photos.get(inputFile, isRaw, res.photoReused, errorCode);
+    KeptPhoto *photo = photos.get(inputFile, isRaw, res.photoReused, errorCode, ahead);
     res.load = ms(t0, Clock::now());
     if (!photo) {
         return fail(-2, "impossible to load file: " + inputFile);
@@ -1490,9 +1851,14 @@ Result runCli(const std::vector<Glib::ustring> &args, Photos &photos, const std:
 
     art::engine::sb::Times times;
     art::engine::Imagefloat *resultImage = nullptr;
-    photos.keepMidOnly(photo);   // (0.3: before this one is developed: at most this photo's in memory)
+    if (!ahead) {
+        photos.keepMidOnly(photo);   // (0.3: before this one is developed: at most this photo's in memory)
+    }
     {
-        art::engine::sb::Processor proc(*job, photo->kept, cancel, times, errorCode);
+        // (0.6: made ahead: the photo in its own place keeps its middle pictures - a film's second picture starts there -
+        // but no later ones; a photo kept for editing keeps nothing new)
+        const bool own = photos.isAhead(photo);
+        art::engine::sb::Processor proc(*job, photo->kept, cancel, times, errorCode, !ahead || own, !ahead);
         resultImage = proc();
     }
     job.reset();
@@ -1501,6 +1867,7 @@ Result runCli(const std::vector<Glib::ustring> &args, Photos &photos, const std:
     res.rawReused = times.rawReused;
     res.earlyReused = times.earlyReused;
     res.midReused = times.midReused;
+    res.lateReused = times.lateReused;
     if (!resultImage) {
         if (errorCode == art::engine::sb::STOPPED) {
             return fail(Stopped, "stopped");
@@ -1563,6 +1930,7 @@ std::string reusedText(const Result &r)
     s += r.rawReused ? ",raw:reused" : ",raw:made";
     s += r.earlyReused ? ",small:reused" : "";
     s += r.midReused ? ",mid:reused" : "";
+    s += r.lateReused == 2 ? ",late:2" : r.lateReused == 1 ? ",late:1" : "";
     char t[160];
     snprintf(t, sizeof(t), ",load:%.0f,raw:%.0f,develop:%.0f,save:%.0f", r.load, r.raw, r.develop, r.save);
     return s + t + (r.steps.empty() ? "" : ",steps:" + r.steps);
@@ -1775,6 +2143,7 @@ int render(int argc, char **argv)
         std::cout << "#" << n << ": " << (res.photoReused ? "photo kept" : "loaded " + std::to_string((int)res.load) + " ms")
                   << ", raw steps " << (res.rawReused ? "reused" : std::to_string((int)res.raw) + " ms")
                   << (res.earlyReused ? ", small picture reused" : "")
+                  << (res.lateReused ? ", after stage " + std::to_string(res.lateReused) + " reused" : "")
                   << ", developed " << (int)res.develop << " ms, saved " << (int)res.save << " ms" << std::endl;
     }
     std::cout << "total " << (int)ms(t0, Clock::now()) << " ms" << std::endl;

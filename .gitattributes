@@ -1,0 +1,7 @@
+# Keep the helper's files with LF line endings (as written) on every computer: no conversion, no warning.
+* text=auto eol=lf
+*.cc text eol=lf
+*.cmake text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+LICENSE text eol=lf
