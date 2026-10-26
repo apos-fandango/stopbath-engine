@@ -3,7 +3,14 @@
 A small program built from ART's own processing engine (ART by Alberto Griggio, itself a fork of RawTherapee), for
 the StopBath photo app. StopBath starts it and talks to it; it develops photos the way ART does.
 
-**Version 0.6 (now):** as 0.5, and the picture after ART's stage 1 (channel mixer, exposure, HSL, tone equalizer)
+**Version 0.7 (now):** as 0.6, and each answer's `<what was reused>` says how ART made the picture:
+`geo:full=WxH;photo=WxH;crop=XxY;scale=S;out=WxH` - the full-size picture for these settings (the crop's size, else
+the photo's, as turned), the photo's own size, where the crop sits in it, the scale of the quick route and the size of
+the picture made - so StopBath places zoomed-in parts from ART's own numbers. `--memory small|normal|large` sets how
+much it keeps: small keeps two middle pictures and none after stage 1 and 2; normal (as 0.6) three and three, up to
+12 MP; large four and four, up to 30 MP. Pictures are still ART-cli's, pixel for pixel.
+
+**Version 0.6:** as 0.5, and the picture after ART's stage 1 (channel mixer, exposure, HSL, tone equalizer)
 and after its stage 2 (sharpening, impulse noise, defringe, colour correction, smoothing) is kept as well, for each
 size and crop of picture asked for (at most three), as ART's own editor does: a change of the tone curve, saturation,
 local contrast and the other stage 3 steps starts after stage 2, a change in stage 2 after stage 1. (Not after stage
@@ -38,7 +45,7 @@ measured for automatic noise reduction) while only later settings change, so a c
 are ART-cli's, pixel for pixel. Anything it doesn't do is left to ART-cli.
 
     stopbath-engine --version
-    stopbath-engine --serve [--keep <n>]        (StopBath's way; requests on standard input)
+    stopbath-engine --serve [--keep <n>] [--memory small|normal|large]   (StopBath's way; requests on standard input)
     stopbath-engine --render <photo> <out.jpg> [--profile <file.arp>]... [--fast] [--repeat <n>]   (a timing test)
 
 `--serve` reads requests one at a time:

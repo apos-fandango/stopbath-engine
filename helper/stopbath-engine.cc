@@ -12,10 +12,12 @@
  *  profile, no metadata: ART's saving rewrites the whole file to add that). 0.6: the picture after ART's stage 1 (exposure,
  *  channel mixer, HSL, tone equalizer) and after stage 2 (sharpening, colour correction, smoothing...) is kept too, as
  *  ART's editor does: a change in a later stage starts there; "-N" (a picture made ahead) keeps nothing, so it doesn't
- *  push out the photo being edited:
+ *  push out the photo being edited. 0.7: each answer also says the picture's geometry - the full-size picture's size for
+ *  these settings (the crop's, else the photo's, as turned), where the crop sits, the scale of the quick route and the
+ *  size of the picture made ("geo:" in <what was reused>), so StopBath needn't work them out itself:
  *
  *    stopbath-engine --version
- *    stopbath-engine --serve [--keep <n>]
+ *    stopbath-engine --serve [--keep <n>] [--memory small|normal|large]   (0.7: how much of ART's steps is kept)
  *        requests on standard input, one at a time:
  *          run <id> <count>        then <count> lines: ART-cli's arguments (-o/-O, -p, -d, -Y, -f, -j, -js, -t, -b,
  *                                  -n, -c <one photo>), one per line; StopBath's own: -R, -Q, -N
@@ -99,7 +101,7 @@ using Clock = std::chrono::steady_clock;
 
 namespace {
 
-const char *HelperVersion = "0.6";
+const char *HelperVersion = "0.7";
 
 double ms(Clock::time_point a, Clock::time_point b)
 {
@@ -350,10 +352,26 @@ struct Kept {
     }
 };
 
+/** 0.7: how much is kept ("--memory"): the middle pictures (per size), the later pairs (per size), and up to what size a
+ *  later pair is kept (normal: 3, 3, 12 MP; small: 2, none; large: 4, 4, 30 MP). */
+struct Memory {
+    size_t mids = 3, lates = 3;
+    long long lateMaxPixels = 12000000;
+};
+inline Memory &memory()
+{
+    static Memory m;
+    return m;
+}
+
 struct Times {
     double raw = 0, develop = 0;
     bool rawReused = false, earlyReused = false, midReused = false;
     int lateReused = 0;   // 0.6: after ART's stage 1 or 2 (0: neither)
+    // 0.7: the picture's geometry: the photo's full size as turned, the crop (in it), the quick route's scale
+    int fullW = 0, fullH = 0, cropX = 0, cropY = 0, cropW = 0, cropH = 0;
+    bool cropOn = false;
+    double scale = 1;
 };
 
 enum { STOPPED = -100 };
@@ -480,6 +498,15 @@ private:
             scale_factor = ipf.resizeScale(&params, fw, fh, imw, imh);
             adjust_procparams(scale_factor);
         }
+        // 0.7: the geometry, for the answer
+        times.fullW = fw;
+        times.fullH = fh;
+        times.cropOn = params.crop.enabled;
+        times.cropX = params.crop.x;
+        times.cropY = params.crop.y;
+        times.cropW = params.crop.w;
+        times.cropH = params.crop.h;
+        times.scale = scale_factor;
 
         imgsrc->setCurrentFrame(params.raw.bayersensor.imageNum);
 
@@ -864,7 +891,7 @@ private:
                      return k.mid.fast == midKey.fast && k.mid.scale == midKey.scale;
                  }),
                  ls.end());
-        while (ms.size() >= 3) {
+        while (ms.size() >= std::max<size_t>(1, memory().mids)) {
             size_t oldest = 0;
             for (size_t i = 1; i < ms.size(); ++i) {
                 if (ms[i].used < ms[oldest].used) {
@@ -951,7 +978,7 @@ private:
                 return l;
             }
         }
-        while (ls.size() >= 3) {
+        while (!ls.empty() && ls.size() >= std::max<size_t>(1, memory().lates)) {
             size_t oldest = 0;
             for (size_t i = 1; i < ls.size(); ++i) {
                 if (ls[i].used < ls[oldest].used) {
@@ -967,7 +994,7 @@ private:
     void keep_late(int level, bool viewport, int vx, int vy, int vw, int vh)
     {
         // (0.6: not for a big picture - a whole photo at full size: two more copies of it would be a lot of memory)
-        if (!keepLate || (long long)img->getWidth() * img->getHeight() > LateMaxPixels) {
+        if (!keepLate || memory().lates == 0 || (long long)img->getWidth() * img->getHeight() > memory().lateMaxPixels) {
             return;
         }
         Kept::Late &l = late_slot();
@@ -1264,7 +1291,6 @@ private:
     bool keep = true;
     bool keepLate = true;
     LateKey lateKey1, lateKey2;   // 0.6
-    static constexpr long long LateMaxPixels = 12000000;   // (the loupe's, a part's: far less)
     Kept::Late *lateHit = nullptr;
     int lateLevel = 0;
 };
@@ -1468,6 +1494,7 @@ struct Result {
     double load = 0, raw = 0, develop = 0, save = 0;
     bool photoReused = false, rawReused = false, earlyReused = false, midReused = false;
     int lateReused = 0;   // 0.6: the picture after ART's stage 1 or 2
+    std::string geo;      // 0.7: the picture's geometry (see reusedText)
 };
 
 /** 0.3: a picture as three planes of 32-bit numbers (red, then green, then blue; each row after row), after a header:
@@ -1868,6 +1895,16 @@ Result runCli(const std::vector<Glib::ustring> &args, Photos &photos, const std:
     res.earlyReused = times.earlyReused;
     res.midReused = times.midReused;
     res.lateReused = times.lateReused;
+    if (resultImage) {
+        // 0.7: full=<the full-size picture for these settings: the crop's size, else the photo's>,
+        // photo=<the photo's size as turned>, crop=<x x y of the crop in it, or 0x0>, scale=<the quick route's>, out=<made>
+        char g[200];
+        const int fullW = times.cropOn ? times.cropW : times.fullW, fullH = times.cropOn ? times.cropH : times.fullH;
+        snprintf(g, sizeof(g), "full=%dx%d;photo=%dx%d;crop=%dx%d;scale=%.9g;out=%dx%d", fullW, fullH, times.fullW, times.fullH,
+                 times.cropOn ? times.cropX : 0, times.cropOn ? times.cropY : 0, times.scale, resultImage->getWidth(),
+                 resultImage->getHeight());
+        res.geo = g;
+    }
     if (!resultImage) {
         if (errorCode == art::engine::sb::STOPPED) {
             return fail(Stopped, "stopped");
@@ -1931,6 +1968,7 @@ std::string reusedText(const Result &r)
     s += r.earlyReused ? ",small:reused" : "";
     s += r.midReused ? ",mid:reused" : "";
     s += r.lateReused == 2 ? ",late:2" : r.lateReused == 1 ? ",late:1" : "";
+    s += r.geo.empty() ? "" : ",geo:" + r.geo;
     char t[160];
     snprintf(t, sizeof(t), ",load:%.0f,raw:%.0f,develop:%.0f,save:%.0f", r.load, r.raw, r.develop, r.save);
     return s + t + (r.steps.empty() ? "" : ",steps:" + r.steps);
@@ -2230,6 +2268,16 @@ int main(int argc, char **argv)
         for (int i = 2; i + 1 < argc; ++i) {
             if (!strcmp(argv[i], "--keep")) {
                 keep = std::max(1, atoi(argv[i + 1]));
+            } else if (!strcmp(argv[i], "--memory")) {   // 0.7
+                auto &m = art::engine::sb::memory();
+                if (!strcmp(argv[i + 1], "small")) {
+                    m.mids = 2;
+                    m.lates = 0;
+                } else if (!strcmp(argv[i + 1], "large")) {
+                    m.mids = 4;
+                    m.lates = 4;
+                    m.lateMaxPixels = 30000000;
+                }
             }
         }
         return serve(keep);
@@ -2240,7 +2288,7 @@ int main(int argc, char **argv)
     if (argc > 1 && !strcmp(argv[1], "--render")) {
         return render(argc, argv);
     }
-    std::cout << "usage: stopbath-engine --version | --serve [--keep <n>] | --render <photo> <out.jpg> [--profile "
+    std::cout << "usage: stopbath-engine --version | --serve [--keep <n>] [--memory small|normal|large] | --render <photo> <out.jpg> [--profile "
                  "<file.arp>]... [--fast] [--repeat <n>]"
               << std::endl;
     return 0;
