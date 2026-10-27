@@ -59,6 +59,12 @@ and answers `@@SB ready <helper version> <ART version>` once, then `@@SB done <i
 reused> <message>` for each (exit code 99: not done by the helper - use ART-cli; 98: stopped). Other lines on
 standard output are ART's own.
 
+**The engine package (no ART install needed):** the folder holds a complete portable ART (ART, ART-cli, camera
+data, colour profiles, lens data, ART's bundled profiles) beside the helper. StopBath starts the helper, ART-cli
+and ART with `ART_SETTINGS` / `ART_CACHE` pointing at StopBath's own folders, so an installed ART is neither needed
+nor touched. A tag (e.g. `engine-0.7`) publishes the package as a public release
+(`stopbath-engine-windows-x64.zip` + `.sha256`), which StopBath downloads.
+
 Built automatically on every upload (the Actions tab): the result, `stopbath-engine-windows-x64`, is on each
 successful run's page. It is ART's own build of version 1.26.10 with the helper added, so it also holds ART and
 ART-cli.
